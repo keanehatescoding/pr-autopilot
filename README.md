@@ -81,7 +81,8 @@ ntfy app. The topic is stored in `state/ntfy-topic`, outside the repo, because a
 ## Commands
     ./autopilot.sh status              # bot PRs, today's runs, last usage reading
     ./autopilot.sh set-ntfy-topic      # set or change the phone-alert topic (kept out of the repo); sends a test alert
-    ./autopilot.sh doctor              # health check: tools, config, logins, timer, last tick, secrets, disk (exit 1 on a FAIL)
+    ./autopilot.sh doctor              # health check: tools, config, logins, timer, last tick, secrets, disk (exit 1 on a FAIL).
+                                       # The first tick of each day runs it too and alerts you if a check FAILs.
     ./publish.sh                       # publish the committed code to the public GitHub repo as one snapshot commit (history and tags stay local)
     ./autopilot.sh usage               # read plan usage now
     DRY_RUN=1 ./autopilot.sh tick      # show decisions, change nothing

@@ -198,7 +198,9 @@ budget_ok() {
     end' <<<"$u" 2>/dev/null)
   if [[ $verdict == ok ]]; then WHY=""
   else WHY=${verdict:-could not work out the budget from the usage reading (failing safe)}; fi
-  log "  usage: 5h=$(jq -r '.five*100|floor' <<<"$u" 2>/dev/null)% week=$(jq -r '.seven*100|floor' <<<"$u" 2>/dev/null)% ${WHY:+-> blocked: $WHY}"
+  # one line per tick, not one per waiting PR (the gate itself still runs every time)
+  local line; line="  usage: 5h=$(jq -r '.five*100|floor' <<<"$u" 2>/dev/null)% week=$(jq -r '.seven*100|floor' <<<"$u" 2>/dev/null)% ${WHY:+-> blocked: $WHY}"
+  [[ $line == "${USAGE_LOGGED-}" ]] || { log "$line"; USAGE_LOGGED=$line; }
   [[ -z $WHY ]]
 }
 
@@ -1907,6 +1909,25 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
   fi
   daily_digest || true
   housekeeping || true
+  daily_doctor || true
+}
+
+# Once a day the tick runs doctor itself and alerts on a FAIL, so a broken setup (gh logged out,
+# disk full, a secret file others can read) is noticed without anyone asking. "GitHub did not
+# answer" alone is retried on the next two ticks first: a laptop that just woke has no network yet.
+daily_doctor() {
+  local mark="$STATE/doctor-day" out fails l tries
+  [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$TODAY" ]] && return 0
+  if out=$(doctor 2>&1); then echo "$TODAY" > "$mark"; rm -f "$mark.retry"; log "daily check: healthy"; return 0; fi
+  fails=$($GREP -E '^  FAIL  ' <<<"$out" | sed 's/^  FAIL  //')
+  if [[ $fails == "GitHub did not answer"* && $fails != *$'\n'* ]]; then
+    tries=$(cat "$mark.retry" 2>/dev/null); [[ $tries =~ ^[0-9]+$ ]] || tries=0
+    if (( tries < 2 )); then echo $((tries + 1)) > "$mark.retry"; log "daily check: GitHub did not answer; trying again next tick"; return 0; fi
+  fi
+  echo "$TODAY" > "$mark"; rm -f "$mark.retry"
+  log "daily check: not healthy"
+  while IFS= read -r l; do [[ -n $l ]] && log "  FAIL $l"; done <<<"$fails"
+  notify critical "pr-autopilot: daily check found a problem" "${fails:-doctor failed; run ./autopilot.sh doctor}" "doctor ${fails}"
 }
 
 # Runs each free agent on a throwaway repo and checks that the sandbox holds.
@@ -2452,6 +2473,32 @@ config_errors() {
   return 0
 }
 
+# public_copy_state: none (no remote "public") | never (not published yet) | current | behind.
+# Compares the files committed here with the last snapshot publish.sh made; no network.
+public_copy_state() {
+  local g=(git --no-optional-locks -C "$HERE") pub
+  "${g[@]}" remote get-url public >/dev/null 2>&1 || { echo none; return 0; }
+  pub=$("${g[@]}" rev-parse -q --verify 'refs/heads/public^{tree}' 2>/dev/null) || { echo never; return 0; }
+  [[ $pub == "$("${g[@]}" rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" ]] && echo current || echo behind
+}
+
+# waiting_json: {"<repo>-<n>": {"h": <head>, "t": <since>}} for the fixes no agent could take yet
+waiting_json() {
+  local f h t
+  for f in "$STATE"/waiting/*; do
+    [[ -f $f ]] || continue
+    h="" t=""; read -r h t < "$f" || true
+    [[ $t =~ ^[0-9]+$ ]] && printf '%s\t%s\t%s\n' "${f##*/}" "$h" "$t"
+  done | jq -Rn '[inputs | split("\t") | {key: .[0], value: {h: .[1], t: (.[2] | tonumber)}}] | from_entries'
+}
+
+# status_pr_lines <prs-json>: one line per open bot PR
+status_pr_lines() {
+  jq -r --argjson now "$NOW" --argjson w "$(waiting_json)" --argjson max "${CLAUDE_WAIT_HOURS:-24}" '.[] | "  \(.repo)#\(.n)  ci=\(.ci)  coderabbit=\(if .cr_clean then "clean" elif .cr_reviewed_head then "reviewed" else "pending" end)  threads=\(.threads|length)  head \((($now - .head_time)/3600)|floor)h old  \(.labels - ["autopilot"] | join(","))" +
+    ($w["\(.repo)-\(.n)"] as $x | if $x != null and $x.h == .head
+      then "  fix waiting \((($now - $x.t)/3600)|floor)h for an agent" + (if $max > 0 then " (yours at \($max)h)" else "" end) else "" end)' <<<"$1"
+}
+
 # doctor: is everything the bot depends on in place? Read-only and free (one GitHub call, no agent,
 # no Claude). Exit 1 when a check FAILs; WARNs are things that work but deserve a look.
 doctor() {
@@ -2516,6 +2563,11 @@ doctor() {
     d_warn "hypridle suspends the laptop when idle, also in Claude hours $WINDOW_START:00-$WINDOW_END:00 (see ./suspend-guard)"
   fi
   [[ -z $(git --no-optional-locks -C "$HERE" remote 2>/dev/null) ]] && d_warn "no copy of the bot off this disk (no git remote; state/ holds the tokens and is never committed)"
+  case $(public_copy_state) in
+    current) d_ok "the public copy has this code" ;;
+    behind)  d_warn "the public copy is behind the code here (./publish.sh)" ;;
+    never)   d_warn "the code has never been published to the public remote (./publish.sh)" ;;
+  esac
   echo; if (( bad )); then echo "Not healthy: fix the FAIL lines above."; else echo "Healthy (WARN lines are worth a look)."; fi
   return $bad
 }
@@ -2558,7 +2610,7 @@ show_status() {
   parked=$(jq --arg l "$LABEL" '[.[] | select(.labels | any(. == $l + "-needs-human" or . == $l + "-stuck" or . == $l + "-ready"))] | length' <<<"$prs")
   echo
   echo "Work slots: $((open - parked))/$MAX_OPEN_PRS active ($open open, $parked parked; no new work at $((2 * MAX_OPEN_PRS)) open)"
-  jq -r --argjson now "$NOW" '.[] | "  \(.repo)#\(.n)  ci=\(.ci)  coderabbit=\(if .cr_clean then "clean" elif .cr_reviewed_head then "reviewed" else "pending" end)  threads=\(.threads|length)  head \((($now - .head_time)/3600)|floor)h old  \(.labels - ["autopilot"] | join(","))"' <<<"$prs"
+  status_pr_lines "$prs"
   echo
   # why the next eligible repo isn't scanned yet (the same gates as tick)
   local held=""

@@ -289,6 +289,10 @@ has "budget: reset time in the past is not extra room"  "1|weekly 97% is ahead o
 eq  "budget: only the unreadable reading was probed again" "probe" "$(cat "$W/probes" 2>/dev/null)"
 rm -f "$W/probes"
 usage 0.20 0.30
+# fix51: the usage line is logged once per tick, however many PRs ask the gate
+ul() ( log() { echo "$*" >> "$W/ul_out"; }; rm -f "$W/ul_out"; rm -f "$STATE/daystart-$TODAY"; echo 0.25 > "$STATE/daystart-$TODAY"
+  unset USAGE_LOGGED; budget_ok; a=$?; budget_ok; b=$?; echo "$a$b $($GREP -c 'usage: ' "$W/ul_out")" )
+case $(ul) in "00 1"|"11 1") PASS=$((PASS+1)) ;; *) FAILS+=("budget: usage line once per tick: got $(ul)") ;; esac
 
 # choose_engine, with free_ready and budget_ok stubbed
 eval "real_$(declare -f budget_ok)"
@@ -498,6 +502,34 @@ has "digest: trials counted apart"     "Agent runs: 1 Claude, 2 free (+2 idle-ti
 has "digest: no trials, no mention"    "Agent runs: 0 Claude, 1 free; 0 fix pushes" "$(dg '  starting kilo (kilo/x:free, free): fix-r-1')"
 eq  "nothing reached Claude or the network"             "" "$(cat "$W/forbidden" 2>/dev/null)"
 
+# fix51: daily doctor, public copy state, waiting time in status
+dd() ( rm -f "$STATE/doctor-day" "$STATE/doctor-day.retry" "$W/dd_out"; log() { :; }
+  notify() { echo "notify $1|$2|$3" >> "$W/dd_out"; }
+  doctor() { echo run >> "$W/dd_out"; printf '%b' "$DD_OUT"; return "$DD_RC"; }
+  for i in $(seq "${1:-1}"); do daily_doctor; done; cat "$W/dd_out" 2>/dev/null; echo "mark=$(cat "$STATE/doctor-day" 2>/dev/null)" )
+if declare -F daily_doctor >/dev/null; then
+  eq  "daily doctor: healthy runs once a day, no alert"  "run
+mark=$TODAY" "$(DD_RC=0 DD_OUT='  ok    fine\n' dd 3)"
+  eq  "daily doctor: a FAIL alerts once with the reason" "run
+notify critical|pr-autopilot: daily check found a problem|only 3 MB of disk left
+mark=$TODAY" "$(DD_RC=1 DD_OUT='  ok    fine\n  FAIL  only 3 MB of disk left\n' dd 2)"
+  eq  "daily doctor: GitHub alone is retried twice first" "run
+run
+mark=" "$(DD_RC=1 DD_OUT='  FAIL  GitHub did not answer (no network)\n' dd 2)"
+  has "daily doctor: GitHub still down on the third tick alerts" "notify critical" "$(DD_RC=1 DD_OUT='  FAIL  GitHub did not answer (no network)\n' dd 4)"
+  eq  "daily doctor: dry run does nothing" "mark=" "$(DRY_RUN=1; DD_RC=1 DD_OUT='  FAIL  x\n' dd 1)"
+  pc() ( HERE="$W/pc"; rm -rf "$HERE"; mkdir -p "$HERE"; g() { git -C "$HERE" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@" >/dev/null 2>&1; }
+    g init -q; echo 1 > "$HERE/f"; g add f; g commit -qm one; r=$(public_copy_state)
+    g remote add public https://example.invalid/x.git; r+=" $(public_copy_state)"
+    g update-ref refs/heads/public HEAD; r+=" $(public_copy_state)"
+    echo 2 > "$HERE/f"; g commit -qam two; echo "$r $(public_copy_state)" )
+  eq  "doctor: public copy none/never/current/behind" "none never current behind" "$(pc)"
+  sp() ( rm -rf "$STATE/waiting"; mkdir -p "$STATE/waiting"; echo "abc $((NOW - 7300))" > "$STATE/waiting/r-1"; echo "old $((NOW - 7300))" > "$STATE/waiting/r-2"; CLAUDE_WAIT_HOURS=24
+    status_pr_lines '[{"repo":"r","n":1,"ci":"ok","cr_clean":true,"threads":[],"head_time":'"$NOW"',"labels":["autopilot"],"head":"abc"},{"repo":"r","n":2,"ci":"ok","cr_clean":true,"threads":[],"head_time":'"$NOW"',"labels":["autopilot"],"head":"new"},{"repo":"r","n":3,"ci":"ok","cr_clean":true,"threads":[],"head_time":'"$NOW"',"labels":["autopilot"],"head":"z"}]' )
+  has "status: waiting time shown"                "r#1  ci=ok  coderabbit=clean  threads=0  head 0h old    fix waiting 2h for an agent (yours at 24h)" "$(sp)"
+  eq  "status: no waiting note for a new head or no wait" "1" "$(sp | $GREP -c 'fix waiting')"
+  eq  "status: no waiting files is fine"          "3" "$(rm -rf "$STATE/waiting"; status_pr_lines '[{"repo":"r","n":1,"ci":"ok","cr_clean":true,"threads":[],"head_time":0,"labels":[],"head":"a"},{"repo":"r","n":2,"ci":"ok","cr_clean":true,"threads":[],"head_time":0,"labels":[],"head":"a"},{"repo":"r","n":3,"ci":"ok","cr_clean":true,"threads":[],"head_time":0,"labels":[],"head":"a"}]' | wc -l)"
+else FAILS+=("fix51: daily_doctor / public_copy_state / status_pr_lines missing"); fi
 echo "$PASS passed, ${#FAILS[@]} failed  ($SRC)"
 for f in "${FAILS[@]}"; do echo "  FAIL: $f"; done
 (( ${#FAILS[@]} == 0 ))
