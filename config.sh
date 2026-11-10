@@ -1,7 +1,7 @@
 # pr-autopilot configuration (sourced by autopilot.sh)
 
 OWNER="keanehatescoding"
-EXCLUDE_REPOS="Server-Admin-Github-Runners CyberShield hp-245-g10-mic-mute-led"            # space-separated repo names the bot must never touch
+EXCLUDE_REPOS="Server-Admin-Github-Runners CyberShield hp-245-g10-mic-mute-led pr-autopilot"            # space-separated repo names the bot must never touch
 
 # ---- Claude budget (the plan is also used interactively) -------------------------------------
 # Before every Claude run the bot reads the plan's real utilization.
