@@ -530,7 +530,7 @@ run_free() {
   log "  starting $agent ($model, free): $tag"
   allowed=$(jq -r '.permission.bash | to_entries | map(select(.value=="allow") | .key | select(endswith(" *") | not)) | join(", ")' "$AGENT_CFG/opencode/opencode.json")
   local started; started=$(date +%s)
-  { cat; printf '\n\n# Shell\nOnly these shell commands are allowed: %s. Run ONE command per call: a command joined with &&, ||, ; or | is denied as a whole, even when every part is allowed, so make separate calls instead. Read and search files with your read/grep/glob tools or cat/grep/sed. Commit with ONE plain command: git commit -m "subject" -m "body" (no $(...), heredocs, pipes or git -c); an "Unable to create ...packed-refs.lock" message after it is harmless, the commit succeeded. If a command is denied, keep going: for a pr result the harness commits any edits you leave uncommitted, so never downgrade a finished fix to an issue because a commit failed.\n' "$allowed"
+  { cat; printf '\n\n# Shell\nOnly these shell commands are allowed: %s. Run ONE command per call: a command joined with &&, ||, ; or | is denied as a whole, even when every part is allowed, so make separate calls instead. Never start a command with cd: you are already in the repository root, a command that starts with cd is always denied, and relative paths work. Read and search files with your read/grep/glob tools or cat/grep/sed. Commit with ONE plain command: git commit -m "subject" -m "body" (no $(...), heredocs, pipes or git -c); an "Unable to create ...packed-refs.lock" message after it is harmless, the commit succeeded. If a command is denied, keep going: for a pr result the harness commits any edits you leave uncommitted, so never downgrade a finished fix to an issue because a commit failed.\n' "$allowed"
     printf '\n\n# Output\nWhen you are done, reply with ONLY a JSON object (no other text, no code fence) matching this JSON schema:\n%s\n' "$schema"; } |
     free_step "$spec" "$dir" "$out" "$FREE_TIMEOUT" "" "$schema"
   rc=$?
@@ -1197,16 +1197,32 @@ prune_pr_state() {
   [[ $DRY_RUN == 1 ]] && return
   local open k f repo n st
   open=$(jq -r '.[] | "\(.repo)-\(.n)"' <<<"$1")
-  for k in $( { /usr/bin/ls "$STATE"/{rounds,crreq,updated,reopened,bodyfix,mergefail,cifix} 2>/dev/null
+  for k in $( { /usr/bin/ls "$STATE"/{rounds,crreq,updated,reopened,bodyfix,mergefail,cifix,waiting} 2>/dev/null
                 /usr/bin/ls "$STATE/freefail" 2>/dev/null | sed -n 's/^fix-//p'; } | /usr/bin/grep -E '^[A-Za-z0-9._-]+-[0-9]+$' | sort -u); do
     /usr/bin/grep -qxF -- "$k" <<<"$open" && continue
     repo=${k%-*}; n=${k##*-}
     st=$(gh pr view "$n" -R "$OWNER/$repo" --json state --jq .state 2>/dev/null) || continue
     [[ $st == MERGED || $st == CLOSED ]] || continue
     log "  $repo#$n is ${st,,} - clearing its bot state"
-    for f in rounds crreq updated reopened bodyfix mergefail cifix; do rm -f "$STATE/$f/$k"; done
+    for f in rounds crreq updated reopened bodyfix mergefail cifix waiting; do rm -f "$STATE/$f/$k"; done
     rm -f "$STATE/freefail/fix-$k" "$STATE/mergefail/$k.why"
   done
+}
+# wait_handoff <repo> <n> <head> <why>: a queued fix that no agent can take (its free tries are used
+# and Claude is blocked by hours or budget) used to wait without limit and without a word
+# (2026-11-10: strathmore#153 and rhythm#8 sat 33h while the week was ahead of pace). After
+# CLAUDE_WAIT_HOURS on the same commit the PR is handed to the owner, which also frees its slot.
+wait_handoff() {
+  local f="$STATE/waiting/$1-$2" h="" since=0 hrs max=${CLAUDE_WAIT_HOURS:-24}
+  [[ $DRY_RUN == 1 ]] && return 0
+  (( max > 0 )) || return 0
+  [[ -f $f ]] && read -r h since < "$f"
+  if [[ $h != "$3" || ! $since =~ ^[0-9]+$ ]]; then mkdir -p "$STATE/waiting"; echo "$3 $NOW" > "$f"; return 0; fi
+  hrs=$(( (NOW - since) / 3600 ))
+  (( hrs >= max )) || return 0
+  log "  no agent could take $1#$2 for ${hrs}h - handing it to you"
+  add_label "$1" "$2" "$LABEL-needs-human" "no agent could take the next fix for ${hrs}h ($4)" && rm -f "$f"
+  return 0
 }
 queue_fix() { # <pr-json> <repo> <n> <rounds>
   if (( $4 >= MAX_FIX_ROUNDS )); then
@@ -1303,6 +1319,7 @@ review_prs() {
     fi
     (( $(jq '[.threads[] | select(.reply)] | length' <<<"$pr") )) && log "  the reviewer answered a declined thread - the next fix round reconsiders it"
 
+    [[ -n $cbi && $nthreads == 0 && $ci != failed ]] && log "  CodeRabbit left findings outside the review threads - they need a fix round"
     problems=false; waiting=false
     [[ $ci == failed || $nthreads != 0 || $cl_issues == true || -n $cbi ]] && problems=true
     [[ $ci == pending || $reviewed == false || ( $cl_req == true && $cl_done == false ) ]] && waiting=true
@@ -1860,9 +1877,11 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
     FREE_ONLY=""; (( fixed )) && FREE_ONLY=1
     if choose_engine "fix-$fr-$fn" "$round"; then
       (( fixed )) && log "time left in this tick ($(( (EPOCHSECONDS - tick_start) / 60 ))m used): next queued PR"
+      rm -f "$STATE/waiting/$fr-$fn"
       fix_pr "$fpr"; fixed=$((fixed + 1)); worked=1; continue
     fi
     log "fix waiting for $fr#$fn: $WHY"
+    wait_handoff "$fr" "$fn" "$(jq -r .head <<<"$fpr")" "$WHY"
   done
   if (( fixed )); then :
   # Parked PRs (needs-human, stuck, ready but not mergeable by the bot) wait on the owner, so they don't hold a slot; a backlog of
@@ -2417,7 +2436,7 @@ config_errors() {
   local v x
   for v in WEEK_TARGET DAILY_MAX FIVE_HOUR_MAX MAX_RUNS_PER_DAY WINDOW_START WINDOW_END MAX_TURNS FREE_TRIES \
            FREE_MAX_ROUNDS MAX_OPEN_PRS MAX_FIX_ROUNDS MAX_DISCOVERIES_PER_DAY CR_COOLDOWN_MIN REDISCOVER_DAYS \
-           NOTIFY_REPEAT_HOURS FREE_COOLDOWN_MIN; do
+           NOTIFY_REPEAT_HOURS FREE_COOLDOWN_MIN CLAUDE_WAIT_HOURS; do
     x=${!v-}; [[ $x =~ ^[0-9]{1,6}$ ]] || echo "$v is \"$x\", not a whole number"
   done
   for v in RUN_TIMEOUT FREE_TIMEOUT DEPS_TIMEOUT TRIAL_TIMEOUT; do

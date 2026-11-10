@@ -163,6 +163,22 @@ eq  "ntfy: a garbage file means no topic"      "" "$(NTFY_TOPIC_FILE=$W/ntfy-top
 eq  "ntfy: no file keeps the config.sh value"  "old" "$(NTFY_TOPIC_FILE=$W/none; NTFY_TOPIC=old; load_ntfy_topic; echo "$NTFY_TOPIC")"
 eq  "ntfy: config.sh no longer holds a topic"  "" "$($GREP -E '^ *NTFY_TOPIC=.*[A-Za-z0-9]' "$T/../config.sh")"
 
+# ---- a fix that waits too long for an agent is handed over ------------------------------------------
+wh() ( rm -rf "$STATE/waiting"; add_label() { echo "label $1#$2 $3 | $4" >> "$W/wh_out"; }; log() { :; }; rm -f "$W/wh_out"
+  NOW=1000000; wait_handoff r 7 aaa "ahead of pace"                     # first sighting: start the clock
+  NOW=$((1000000 + 23*3600)); wait_handoff r 7 aaa "ahead of pace"      # 23h: still waiting
+  echo "23h:$(cat "$W/wh_out" 2>/dev/null)"
+  NOW=$((1000000 + 23*3600)); wait_handoff r 7 bbb "ahead of pace"      # new commit: the clock restarts
+  NOW=$((1000000 + 46*3600)); wait_handoff r 7 bbb "ahead of pace"      # 23h on the new commit
+  echo "new:$(cat "$W/wh_out" 2>/dev/null)"
+  NOW=$((1000000 + 48*3600)); wait_handoff r 7 bbb "ahead of pace"      # 25h on the new commit
+  echo "25h:$(cat "$W/wh_out" 2>/dev/null)|$(ls "$STATE/waiting" | wc -l)" )
+eq  "handoff: 24h without an agent hands the PR over, a new commit restarts the clock" \
+    "23h: new: 25h:label r#7 autopilot-needs-human | no agent could take the next fix for 25h (ahead of pace)|0" "$(wh | tr '\n' ' ' | sed 's/ $//')"
+eq  "handoff: 0 turns it off" "" "$(CLAUDE_WAIT_HOURS=0; rm -rf "$STATE/waiting"; add_label() { echo labelled; }; NOW=1; wait_handoff r 8 a x; NOW=999999999; wait_handoff r 8 a x)"
+eq  "handoff: a dry run records nothing" "0" "$(DRY_RUN=1; rm -rf "$STATE/waiting"; wait_handoff r 9 a x; ls "$STATE/waiting" 2>/dev/null | wc -l)"
+eq  "free agents are told not to prefix commands with cd" "1" "$($GREP -c 'Never start a command with cd' "$SRC")"
+
 # ---- free model ranking: trial score as a prior, real-run record, ties spread over agents ----------
 list_free_models() { printf '%s\n' agy:a1 agy:a2 agy:a3 kilo:k1 kilo:k2 vibe:v1 opencode:o1 opencode:bad; }
 model_live_stats() { printf '%s\n' "kilo:k1 9 10" "opencode:o1 3 10"; }

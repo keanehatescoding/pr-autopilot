@@ -84,6 +84,7 @@ CLAUDE_REVIEW_CHECK='^claude-review$'   # name of the CI check that runs the Cla
 MERGE_METHOD="squash"       # squash | merge | rebase
 MAX_OPEN_PRS=4              # bot PRs open at once across all repos
 DIGEST_HOUR=9               # daily digest notification after this hour (empty = off)
+CLAUDE_WAIT_HOURS=24        # a fix no agent can take (free tries used, Claude blocked by hours or budget) for this long is handed to you (0 = wait forever)
 MAX_FIX_ROUNDS=5            # after this many fix attempts a PR is labelled autopilot-stuck
 CR_COOLDOWN_MIN=62          # CodeRabbit free plan: wait this long between review requests
 REDISCOVER_DAYS=3           # don't hunt for new work in the same repo more often than this
