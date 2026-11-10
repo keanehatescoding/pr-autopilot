@@ -62,7 +62,6 @@ reading, e.g. the one every Sonnet run returns, is under 10 min old) and only ru
 - weekly usage < `WEEK_TARGET` (95%) × fraction of the week elapsed (pacing, counts everyone's usage),
 - weekly usage grew < `DAILY_MAX` (12 points) today,
 - 5-hour window < `FIVE_HOUR_MAX` (60%),
-
 - it's between `WINDOW_START`–`WINDOW_END` (1am–7am).
 
 A fix that no agent can take for `CLAUDE_WAIT_HOURS` (24) on the same commit, because its free tries are used and Claude is
