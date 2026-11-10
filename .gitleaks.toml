@@ -1,0 +1,8 @@
+# Used by publish.sh. Known false positives: a test fixture quotes the placeholder keys that the
+# public lab repo campus-vlan-radius-lab ships in radius/secrets.env.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "placeholder keys from a public lab repo, quoted in a test fixture"
+regexes = ['''En4ble-Secret-2026''', '''S3cr3t-Shared-Key-2026''']

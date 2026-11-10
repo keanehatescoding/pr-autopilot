@@ -1,0 +1,9 @@
+# runtime data: logs, bot state (logins, keys, tokens, backups), clones and worktrees of other repos
+state/
+logs/
+repos/
+worktrees/
+tests/.work/
+PAUSE
+*.tmp
+*.new
