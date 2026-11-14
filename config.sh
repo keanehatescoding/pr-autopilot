@@ -48,6 +48,34 @@ FREE_TIMEOUT="30m"
 FIX_MORE_WITHIN=15          # a tick done within this many minutes takes another queued PR (free models only; 0 = one fix per tick)
 FREE_COOLDOWN_MIN=60        # an agent that errors out (rate limit, outage, bad output) is skipped this long
 DEPS_TIMEOUT="10m"          # dependency install (npm ci / uv sync ...) before an agent runs, inside the sandbox
+
+# Hosts an agent (and the tests it runs) may reach over the network. Agents have no network of
+# their own: every connection goes through a host proxy that only lets these names through (CONNECT
+# on port 443; see egress_up in autopilot.sh). Anchored regexes, one per host. Found with
+# capture-dns.sh: the model APIs, the free agents' providers, and GitHub (for git over https).
+AGENT_HOSTS=(
+  '^api\.anthropic\.com$'
+  '^opencode\.ai$'
+  '^models\.opencode\.ai$'
+  '^models\.dev$'
+  '^api\.kilo\.ai$'
+  '^ai-gateway\.kilo\.ai$'
+  '^daily-cloudcode-pa\.googleapis\.com$'   # agy (Google's Antigravity CLI): its model API; found by tracing agy models
+  '^api\.mistral\.ai$'                      # vibe (Mistral's CLI): its model API; found by tracing vibe, tested through the proxy
+  '^github\.com$'
+  '^api\.github\.com$'
+)
+# Hosts a dependency install (npm ci, uv sync, ...) may reach: the package registries and GitHub (git
+# dependencies). Kept apart from AGENT_HOSTS so an install never gets a model API or an agent's route.
+DEPS_HOSTS=(
+  '^registry\.npmjs\.org$'
+  '^registry\.yarnpkg\.com$'
+  '^pypi\.org$'
+  '^files\.pythonhosted\.org$'
+  '^github\.com$'
+  '^objects\.githubusercontent\.com$'
+  '^codeload\.github\.com$'
+)
 MAX_DISCOVERIES_PER_DAY=6   # new-work scans per day (any agent), so free runs can't flood repos with issues
 
 # Extra shell commands for free agents only. Safe because they run in a bubblewrap
@@ -57,8 +85,10 @@ FREE_EXTRA_BASH=(cat grep rg sed sort uniq cut tr diff "git --no-pager diff" "gi
 # Agents' commits may not touch these (regex on paths). They could loosen the next
 # agent's sandbox, plant instructions for it, or run code with repo secrets in CI.
 # A commit that does is discarded (free agent) or handed to a human (Claude).
+# Manifests, lockfiles, package-manager config, deploy files, Dockerfiles and CI: a clean PR that changes
+# them waits for you (never auto-merged).
 # .githooks/: hooks run on YOUR machine when you commit/push in your own clone after a merge.
-PROTECTED_PATHS='(^|/)(CLAUDE\.md|AGENTS\.md|\.mcp\.json|opencode\.jsonc?|kilo\.jsonc?)$|^\.(github/workflows|githooks|claude|opencode|kilo|kilocode)/'
+PROTECTED_PATHS='(^|/)(CLAUDE\.md|AGENTS\.md|\.mcp\.json|opencode\.jsonc?|kilo\.jsonc?)$|^\.(github/workflows|githooks|claude|opencode|kilo|kilocode)/|(^|/)(package\.json|pyproject\.toml|setup\.py|setup\.cfg|Cargo\.toml|go\.mod|Pipfile|Gemfile|composer\.json|pom\.xml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|gradle\.properties|requirements[^/]*\.txt|Makefile|CMakeLists\.txt)$|(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$|(^|/)(Dockerfile|Dockerfile\.[^/]*|Containerfile[^/]*)$|(^|/)(\.npmrc|\.yarnrc(\.yml)?|bunfig\.toml|\.gitmodules|docker-compose[^/]*\.ya?ml|cloudbuild\.yaml|Procfile|alembic\.ini)$|^\.circleci/|(^|/)(\.gitlab-ci\.yml|azure-pipelines\.yml|Jenkinsfile|\.travis\.yml)$'
 
 # ---- Notifications --------------------------------------------------------
 # Desktop pop-ups (notify-send) on errors, crashed ticks and PRs handed to you
@@ -95,8 +125,10 @@ WT_KEEP_DAYS=7              # remove a repo's worktree (deps, builds) after this
 RUN_LOG_KEEP_DAYS=30        # delete per-run agent transcripts (logs/*.jsonl, *.err, deps-*.log) older than this; day logs stay
 CACHE_MAX_MB=200            # empty an agent download cache (uv, npm) once it holds more than this on its own
 
-# Review comments from these logins (regex) are treated as feedback to address.
-TRUSTED_REVIEWERS='^(coderabbitai|claude|github-actions)'
+# Review comments from these logins (regex) are treated as feedback to address. Anchored at both ends:
+# unanchored, a stranger's login like "claude-evil" matched and its threads reached the agents.
+# Logins as GraphQL reports them (no [bot] suffix).
+TRUSTED_REVIEWERS='^(coderabbitai|claude|github-actions)$'
 
 # Tools loaded into Claude's context at all. Fewer tools = smaller prompt on every turn
 # (this set is ~8k tokens vs ~15k for the default set) and no subagent spawning.

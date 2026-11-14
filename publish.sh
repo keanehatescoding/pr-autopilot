@@ -24,13 +24,17 @@ if command -v gitleaks >/dev/null; then
   gitleaks detect --no-git --no-banner --redact -c "$HERE/.gitleaks.toml" -s "$tmp" >"$tmp.leaks" 2>&1 || { echo "publish: gitleaks found something:"; tail -n 30 "$tmp.leaks"; bad=1; }
   rm -f "$tmp.leaks"
 else
-  echo "publish: gitleaks is not installed; only the bot's own secrets are checked"
+  # fail closed: without gitleaks the scan is only the bot's own secrets, which is not enough to publish
+  echo "publish: gitleaks is not installed, so the public copy can't be scanned; install it, then publish again"; bad=1
 fi
 # the bot's own secrets (state/) must not appear in any tracked file
 while IFS= read -r -d '' f; do
-  s=$(head -n 1 "$f" 2>/dev/null | tr -d '\r\n'); s=${s#*=}
-  (( ${#s} >= 12 )) || continue
-  if $GREP -rqF -- "$s" "$tmp"; then echo "publish: the secret in ${f#"$HERE"/} appears in a tracked file"; bad=1; fi
+  # every line, not just the first: a .env may hold more than one secret
+  while IFS= read -r line || [[ -n $line ]]; do
+    s=${line%$'\r'}; s=${s#*=}
+    (( ${#s} >= 12 )) || continue
+    if $GREP -rqF -- "$s" "$tmp"; then echo "publish: a secret in ${f#"$HERE"/} appears in a tracked file"; bad=1; break; fi
+  done < "$f"
 done < <(find state -maxdepth 3 -type f \( -name 'claude-token' -o -name 'ntfy-topic' -o -name '.env' \) -print0 2>/dev/null)
 if $GREP -rlE '^-----BEGIN [A-Z ]*PRIVATE KEY-----$' "$tmp" | $GREP -q .; then
   echo "publish: a private key is in a tracked file"; bad=1

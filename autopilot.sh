@@ -29,6 +29,9 @@ load_ntfy_topic() {
   if [[ $t =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then NTFY_TOPIC=$t; elif [[ -e $NTFY_TOPIC_FILE ]]; then NTFY_TOPIC=""; fi
 }
 load_ntfy_topic
+# An access token for a private topic (ntfy.sh access control): the header line, kept in state/ (owner-only).
+# Without it the bot posts without credentials, as before.
+NTFY_AUTH_FILE="$STATE/ntfy-auth"
 # Repo hooks never run in the bot's own git calls. A clone with core.hooksPath=.githooks (a
 # relative path) would otherwise run hooks from the worktree an agent just edited, as you and
 # outside the sandbox, on every commit/push/checkout (2026-11-08: a bot push ran antivirus_arm64's
@@ -70,10 +73,12 @@ notify() { # <low|normal|critical> <title> <body> [dedupe-key]
   date +%s > "$f"
   notify-send -a pr-autopilot -u "$1" -i dialog-warning "$2" "$3" 2>/dev/null || true
   if [[ -n ${NTFY_TOPIC:-} ]]; then
-    local msg; msg=$(jq -nc --arg t "$NTFY_TOPIC" --arg ti "$2" --arg m "$3" --argjson p "$([[ $1 == critical ]] && echo 4 || echo 3)" \
+    local short msg; short=$(sed 's/^pr-autopilot: //' <<<"$2" | head -n 1 | cut -c1-120)   # phone: short, no detail
+    msg=$(jq -nc --arg t "$NTFY_TOPIC" --arg ti "pr-autopilot" --arg m "$short" --argjson p "$([[ $1 == critical ]] && echo 4 || echo 3)" \
        '{topic:$t, title:$ti, message:$m, priority:$p, tags:["robot"]}')
     local e
-    if ! e=$(printf '%s' "$msg" | curl -fsS -m 10 -d @- https://ntfy.sh/ 2>&1 >/dev/null); then
+    local auth=(); [[ -s $NTFY_AUTH_FILE ]] && auth=(-H "@$NTFY_AUTH_FILE")
+    if ! e=$(printf '%s' "$msg" | curl -fsS -m 10 "${auth[@]}" -d @- https://ntfy.sh/ 2>&1 >/dev/null); then
       # kept and resent by the next tick (2026-11-09 14:45: sent right after a resume, before DNS was up)
       mkdir -p "$STATE/ntfy-queue"; printf '%s' "$msg" > "$STATE/ntfy-queue/$EPOCHSECONDS-$RANDOM.json"
       log "  ntfy push failed (queued; the next tick resends it): $(head -1 <<<"$e" | cut -c1-120)"
@@ -86,7 +91,8 @@ flush_ntfy() { # resend queued phone pushes; drop ones older than 12h
     [[ -f $f ]] || continue
     age=${f##*/}; age=$(( EPOCHSECONDS - ${age%%-*} ))
     if (( age > 43200 )); then rm -f "$f"; continue; fi
-    e=$(curl -fsS -m 10 -d @"$f" https://ntfy.sh/ 2>&1 >/dev/null) || { log "  queued phone pushes not resent yet: $(head -1 <<<"$e" | cut -c1-120)"; break; }
+    local auth=(); [[ -s $NTFY_AUTH_FILE ]] && auth=(-H "@$NTFY_AUTH_FILE")
+    e=$(curl -fsS -m 10 "${auth[@]}" -d @"$f" https://ntfy.sh/ 2>&1 >/dev/null) || { log "  queued phone pushes not resent yet: $(head -1 <<<"$e" | cut -c1-120)"; break; }
     rm -f "$f"; (( sent++ ))
   done
   (( sent )) && log "  resent $sent queued phone push(es)"
@@ -98,7 +104,7 @@ fail() { # <what went wrong> [detail]   log + critical notification
 }
 # Secret scan: nothing that looks like a credential is ever posted to GitHub or pushed.
 # Matches common token formats plus the exact values of your own local logins.
-SECRET_RE='\b(gh[opusr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-(proj-)?[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+SECRET_RE='\b(gh[opusr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-(proj-)?[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}|(sk|rk)_live_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{50,})|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 CLAUDE_TOKEN_FILE="$STATE/claude-token"
 known_secrets() { # one per line; never logged
   { gh auth token 2>/dev/null; echo
@@ -152,11 +158,28 @@ parse_rate() {
      seven:.unifiedWindows.seven_day.utilization, seven_reset:.unifiedWindows.seven_day.resetsAt}' 2>/dev/null
 }
 
-# A ~3k-token Haiku call: the cheapest way to read current utilization.
+# A ~3k-token Haiku call: the cheapest way to read current utilization. It runs in its own sandbox with the
+# bot's token and config and the agent proxy (api.anthropic.com), never the owner's ~/.claude login.
 probe_usage() {
-  local u
-  u=$(cd "$STATE" && echo "Reply with just: ok" | timeout 120 claude -p --model haiku --max-turns 1 \
-        --output-format stream-json --verbose --tools "" "${CLAUDE_COMMON[@]}" 2>/dev/null | parse_rate)
+  local u sock="$STATE/egress/proxy.sock" pd="$STATE/usage-probe" v
+  local -a box run
+  [[ -s $CLAUDE_TOKEN_FILE ]] || { log "  usage probe skipped: no bot Claude token"; return 0; }
+  egress_up || return 0
+  mkdir -p "$pd" "$STATE/claude-config"
+  box=(bwrap --die-with-parent --new-session --unshare-all --clearenv
+    --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin --symlink usr/lib /lib --symlink usr/lib /lib64
+    --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run --tmpfs /var --tmpfs /home --tmpfs /root
+    --bind "$pd" "$pd" --bind "$STATE/claude-config" "$STATE/claude-config"
+    --bind "$sock" "$sock" --setenv EGRESS_SOCK "$sock" --chdir "$pd"
+    --setenv PATH /usr/local/bin:/usr/bin --setenv HOME "$pd" --setenv TMPDIR /tmp --setenv TERM dumb
+    --setenv LANG "${LANG:-C.UTF-8}" --setenv SHELL /usr/bin/bash
+    --setenv CLAUDE_CONFIG_DIR "$STATE/claude-config" --setenv CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR 3
+    --setenv CLAUDE_CODE_SUBPROCESS_ENV_SCRUB 1 --setenv DISABLE_AUTOUPDATER 1)
+  for v in HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy; do box+=(--setenv $v "http://127.0.0.1:$EGRESS_PORT"); done
+  [[ -d /opt ]] && box+=(--ro-bind /opt /opt)   # /usr/bin/claude is a wrapper that runs /opt/claude-code
+  run=(/usr/bin/bash -c "$EGRESS_SHIM" egress)
+  u=$(echo "Reply with just: ok" | timeout 120 "${box[@]}" -- "${run[@]}" claude -p --model haiku --max-turns 1 \
+        --output-format stream-json --verbose --tools "" "${CLAUDE_COMMON[@]}" 3<"$CLAUDE_TOKEN_FILE" 2>/dev/null | parse_rate)
   [[ -n $u ]] && echo "$u" > "$STATE/usage.json"
   echo "$u"
 }
@@ -240,7 +263,7 @@ run_claude() {
   sandbox_for "$dir" claude || { fail "sandbox setup failed for $tag"; return 1; }
   echo $(( $(runs_today) + 1 )) > "$STATE/runs-$TODAY"
   log "  starting Claude ($MODEL, run $(runs_today) today, sandboxed): $tag"
-  run_timed "$RUN_TIMEOUT" "${SANDBOX[@]}" -- claude -p --model "$MODEL" --max-turns "$MAX_TURNS" \
+  run_timed "$RUN_TIMEOUT" "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" claude -p --model "$MODEL" --max-turns "$MAX_TURNS" \
       --output-format stream-json --verbose --json-schema "$schema" \
       --tools "$RUN_TOOLS" \
       --permission-mode dontAsk --allowedTools "${ALLOWED_TOOLS[@]}" \
@@ -252,7 +275,9 @@ run_claude() {
   if (( rc == SLEPT_RC )); then log "  Claude stopped: the machine was suspended mid-run; the task is retried later"; return 3; fi
   local res; res=$(jq -sc '[.[]|select(.type=="result")]|last // {}' "$out" 2>/dev/null)
   log "  Claude finished: $(jq -r '"\(.subtype // "no result") turns=\(.num_turns // "?") error=\(.is_error // "?")"' <<<"$res")"
-  if [[ $(jq -r '.is_error // false' <<<"$res") == true ]] && jq -r '.result // ""' <<<"$res" | $GREP -qiE 'limit'; then
+  # only the plan's own wording: a turn-limit error ("limit" alone matched it) must not pause Claude for the day
+  if [[ $(jq -r '.is_error // false' <<<"$res") == true && $(jq -r '.subtype // ""' <<<"$res") != error_max_turns ]] &&
+     jq -r '.result // ""' <<<"$res" | $GREP -qiE 'usage limit|plan limit|limit reached'; then
     fail "Claude plan limit hit" "Claude runs paused for today; free agents keep going"; echo "$MAX_RUNS_PER_DAY" > "$STATE/runs-$TODAY"
   fi
   jq -c '.structured_output // (.result | try fromjson catch empty) // empty' <<<"$res" 2>/dev/null
@@ -303,6 +328,7 @@ agent_config() {
     [[ -f $HOME/.local/share/$a/auth.json ]] && ln -sf "$HOME/.local/share/$a/auth.json" "$AGENT_DATA/$a/auth.json"
   done
   # agy and vibe get the same command allowlist. Both deny anything else in headless mode.
+# (their model API hosts are in AGENT_HOSTS, config.sh)
   # Their home config is rewritten before every run: the agent home is writable, so an agent
   # that granted itself more there would only keep it until the next run.
   local allow; allow=$(jq -c '[to_entries[] | select(.value=="allow") | .key | select(endswith(" *") | not)]' <<<"$rules")
@@ -339,7 +365,8 @@ has_agent_config() {
 # Visible: /usr, /etc, the worktree (rw), the repo's git objects + this worktree's git dir (rw),
 # the rest of that .git read-only (config, hooks, refs: no planting hooks in your clone),
 # the bot's agent config (ro) / data / cache / home, the agent's own login, and toolchains
-# (~/.local/bin, uv, pnpm, rustup, ~/.cargo/bin) read-only. Network stays on (the model API).
+# (~/.local/bin, uv, pnpm, rustup, ~/.cargo/bin) read-only. No network except through the egress
+# proxy, which allows only AGENT_HOSTS (see sandbox_for).
 # Bot-only git excludes: dependency/build artifacts are never committed, and survive `git clean`
 # between runs (so installs are reused). Used inside the sandbox and by the bot's own git calls.
 BOT_EXCLUDES="$AGENT_CFG/git-excludes"; mkdir -p "$AGENT_CFG"
@@ -351,16 +378,67 @@ SANDBOX=()
 # can't reach your desktop keyring (no D-Bus), so agy gets a private bus + gnome-keyring whose
 # keyring lives in the bot's agent-data (keyrings/), signed in once with `autopilot.sh agy-login`.
 # Its password is fixed: like opencode's auth.json, the protection is that only the bot sees it.
+# agy's model API host is in AGENT_HOSTS (config.sh): agy reaches it through the egress proxy.
 AGY_KEYRING=(/usr/bin/bash -c 'mkdir -m700 -p "$XDG_RUNTIME_DIR"; exec dbus-run-session -- /usr/bin/bash -c '\''
   eval "$(printf pr-autopilot | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null)"; exec "$@"'\'' agy "$@"' agy)
-sandbox_for() { # <dir> [claude]
-  local d=$1 common gd home="$STATE/agent-home" cache="$STATE/agent-cache" p
+# Agents have no network of their own. Their traffic goes through a host proxy (tinyproxy, filtered
+# to AGENT_HOSTS) reached over a unix socket: inside the sandbox a socat listener on 127.0.0.1:8899
+# bridges to that socket, and EGRESS_RUN starts it before the agent's command. Test code run by an
+# agent is no exception: it gets the same proxy and no other route out. egress_up keeps the host side
+# running and restarts it when the allowlist changes. The host daemons are the bot's own (not the
+# sandbox's), so they start on the first sandboxed step of a tick and survive it.
+EGRESS_PORT=8899          # the port inside each sandbox's own network namespace, where the bridge listens
+EGRESS_DEPS_PORT=8898     # host port of the dependency installs' proxy (registries only), see egress_deps_up
+EGRESS_SHIM='socat TCP-LISTEN:8899,fork,bind=127.0.0.1 UNIX-CONNECT:"$EGRESS_SOCK" 3<&- 2>/dev/null &
+for _ in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/8899) 2>/dev/null && break; sleep 0.05; done
+exec "$@"'
+EGRESS_RUN=()   # the command prefix that starts the bridge inside the sandbox; empty without the proxy
+egress_start() { # <dir> <host port> <allowed host regexes...>: starts or restarts a host proxy and its socket in <dir>; returns 1 when they don't come up
+  local dir=$1 port=$2 i pid; shift 2
+  mkdir -p "$dir"; printf '%s\n' "$@" > "$dir/allow.new"
+  if ! cmp -s "$dir/allow.new" "$dir/allow.txt" 2>/dev/null || ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    mv "$dir/allow.new" "$dir/allow.txt"
+    [[ -s $dir/tinyproxy.pid ]] && kill "$(cat "$dir/tinyproxy.pid")" 2>/dev/null
+    printf '%s\n' "Port $port" "Listen 127.0.0.1" "Timeout 60" "MaxClients 20" "PidFile \"$dir/tinyproxy.pid\"" \
+      "LogFile \"$dir/tinyproxy.log\"" "FilterDefaultDeny Yes" "Filter \"$dir/allow.txt\"" "FilterExtended Yes" \
+      "ConnectPort 443" > "$dir/tinyproxy.conf"
+    tinyproxy -c "$dir/tinyproxy.conf" </dev/null >>"$LOG" 2>&1
+    for i in $(seq 40); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.05; done
+  else rm -f "$dir/allow.new"; fi
+  pid=$(cat "$dir/socat.pid" 2>/dev/null)
+  if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null || [[ ! -S $dir/proxy.sock ]]; then
+    [[ -n $pid ]] && kill "$pid" 2>/dev/null
+    rm -f "$dir/proxy.sock"
+    socat UNIX-LISTEN:"$dir/proxy.sock",fork,unlink-early,mode=600 TCP:127.0.0.1:$port </dev/null >>"$LOG" 2>&1 &
+    echo $! > "$dir/socat.pid"
+    for i in $(seq 40); do [[ -S $dir/proxy.sock ]] && break; sleep 0.05; done
+  fi
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && [[ -S $dir/proxy.sock ]] && return 0
+  log "  the host egress proxy on port $port did not start (see $LOG); sandboxed commands that need it can't reach their hosts until it does"
+  return 1
+}
+egress_up() { egress_start "$STATE/egress" "$EGRESS_PORT" "${AGENT_HOSTS[@]}"; }                 # agents: model APIs and GitHub
+egress_deps_up() { egress_start "$STATE/egress-deps" "$EGRESS_DEPS_PORT" "${DEPS_HOSTS[@]}"; }   # dependency installs: package registries only
+sandbox_for() { # <dir> [claude] [mode]: mode "" = an agent (the agent proxy); deps = a dependency install (the registry proxy,
+  # its own home and cache, no agent config or login); net = the step's own network, for interactive logins
+  local d=$1 common gd p v sock mode=${3:-agent} home cache cfg data
+  if [[ $mode == deps ]]; then home="$STATE/deps-home"; cache="$STATE/deps-cache"; cfg="$home/.config"; data="$home/.local/share"
+  else home="$STATE/agent-home"; cache="$STATE/agent-cache"; cfg=$AGENT_CFG; data=$AGENT_DATA; fi
   common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir) || return 1
   gd=$(git -C "$d" rev-parse --path-format=absolute --git-dir) || return 1
-  mkdir -p "$home" "$cache"
-  SANDBOX=(bwrap --die-with-parent --new-session --unshare-all --share-net --clearenv
+  mkdir -p "$home" "$cache" "$cfg" "$data"
+  EGRESS_RUN=()
+  SANDBOX=(bwrap --die-with-parent --new-session --unshare-all --clearenv
     --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin --symlink usr/lib /lib --symlink usr/lib /lib64
     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run --tmpfs /var --tmpfs /home --tmpfs /root)
+  if [[ $mode == net ]]; then SANDBOX+=(--share-net)
+  else
+    if [[ $mode == deps ]]; then egress_deps_up || return 1; sock="$STATE/egress-deps/proxy.sock"
+    else egress_up || return 1; sock="$STATE/egress/proxy.sock"; fi
+    SANDBOX+=(--bind "$sock" "$sock" --setenv EGRESS_SOCK "$sock")
+    for v in HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy; do SANDBOX+=(--setenv $v "http://127.0.0.1:$EGRESS_PORT"); done
+    EGRESS_RUN=(/usr/bin/bash -c "$EGRESS_SHIM" egress)
+  fi
   [[ -d /opt ]] && SANDBOX+=(--ro-bind /opt /opt)
   [[ -d /run/systemd/resolve ]] && SANDBOX+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   for p in .local/bin .local/share/uv/python .local/share/uv/tools .local/share/pnpm .rustup .cargo/bin; do
@@ -368,21 +446,23 @@ sandbox_for() { # <dir> [claude]
   done
   SANDBOX+=(--ro-bind "$common" "$common" --bind "$common/objects" "$common/objects")
   [[ $gd != "$common" ]] && SANDBOX+=(--bind "$gd" "$gd") || SANDBOX+=(--bind "$common" "$common")
-  SANDBOX+=(--bind "$d" "$d" --ro-bind "$AGENT_CFG" "$AGENT_CFG" --bind "$AGENT_DATA" "$AGENT_DATA"
-    --bind "$home" "$home" --bind "$cache" "$cache")
+  SANDBOX+=(--bind "$d" "$d" --bind "$home" "$home" --bind "$cache" "$cache")
+  [[ $mode == deps ]] || SANDBOX+=(--ro-bind "$AGENT_CFG" "$AGENT_CFG" --bind "$AGENT_DATA" "$AGENT_DATA")
   # The bot's own git calls run outside the sandbox: an agent repointing the worktree's gitlink
   # (.git file) or commondir/gitdir at a repo it controls would hand them a hostile config
   # (credential.helper, core.sshCommand, ...). Read-only binds also block replacing them (EBUSY).
   for p in "$d/.git" "$gd/commondir" "$gd/gitdir" "$common/config" "$common/hooks"; do
     [[ -f $p || ( $p == "$common/hooks" && -d $p ) ]] && SANDBOX+=(--ro-bind "$p" "$p")
   done
-  for p in opencode kilo; do
-    [[ -f $HOME/.local/share/$p/auth.json ]] && SANDBOX+=(--ro-bind "$HOME/.local/share/$p/auth.json" "$HOME/.local/share/$p/auth.json")
-  done
+  if [[ $mode != deps ]]; then
+    for p in opencode kilo; do
+      [[ -f $HOME/.local/share/$p/auth.json ]] && SANDBOX+=(--ro-bind "$HOME/.local/share/$p/auth.json" "$HOME/.local/share/$p/auth.json")
+    done
+  fi
   SANDBOX+=(--chdir "$d"
     --setenv PATH "$d/.venv/bin:$d/node_modules/.bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.local/share/pnpm:/usr/local/bin:/usr/bin"
     --setenv HOME "$home" --setenv TMPDIR /tmp --setenv TERM dumb --setenv LANG "${LANG:-C.UTF-8}" --setenv SHELL /usr/bin/bash
-    --setenv XDG_CONFIG_HOME "$AGENT_CFG" --setenv XDG_DATA_HOME "$AGENT_DATA"
+    --setenv XDG_CONFIG_HOME "$cfg" --setenv XDG_DATA_HOME "$data"
     --setenv XDG_CACHE_HOME "$cache" --setenv XDG_STATE_HOME "$home/.local/state"
     --setenv GIT_AUTHOR_NAME "$(git config user.name)" --setenv GIT_AUTHOR_EMAIL "$(git config user.email)"
     --setenv GIT_COMMITTER_NAME "$(git config user.name)" --setenv GIT_COMMITTER_EMAIL "$(git config user.email)"
@@ -396,6 +476,16 @@ sandbox_for() { # <dir> [claude]
     SANDBOX+=(--bind "$STATE/claude-config" "$STATE/claude-config" --setenv CLAUDE_CONFIG_DIR "$STATE/claude-config"
       --setenv CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR 3 --setenv CLAUDE_CODE_SUBPROCESS_ENV_SCRUB 1
       --setenv DISABLE_AUTOUPDATER 1)
+  else
+    # Free agents: the read tool denies *.env, but their bash commands (cat, sed, ...) don't, so hide
+    # the untracked env files under empty read-only copies. Tracked files stay visible: hiding one would
+    # make an agent's commit delete it. Claude's Read is not restricted this way (its tests need .env).
+    local f
+    while IFS= read -r -d '' f; do
+      git -C "$d" ls-files --error-unmatch -z -- "$f" >/dev/null 2>&1 && continue
+      SANDBOX+=(--ro-bind /dev/null "$f")
+    done < <(find "$d" \( -name .git -o -name node_modules -o -name .venv \) -prune -o -type f \
+               \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print0)
   fi
 }
 
@@ -511,7 +601,7 @@ free_step() {
   free_cmd "$agent" "$model" "${5:-}" "${6:-}" || return 1
   if [[ $agent == agy ]]; then agy_grant "$2" || { log "  couldn't grant agy its directory; not starting it"; return 1; }; fi
   { if [[ $agent == agy ]]; then jq -Rsc '{event: "user", message: {content: .}}'; else cat; fi; } | { sandbox_for "$2" || { fail "sandbox setup failed for $out"; exit 1; }
-    RUN_WATCH="free_stuck $out" run_timed "$4" "${SANDBOX[@]}" -- "${FREE_CMD[@]}"; } >> "$out" 2> "$tmp"
+    RUN_WATCH="free_stuck $out" run_timed "$4" "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" "${FREE_CMD[@]}"; } >> "$out" 2> "$tmp"
   rc=$?
   # the full stderr stays next to the events; the day log gets it timestamped, one short line each
   if [[ -s $tmp ]]; then
@@ -677,12 +767,45 @@ free_failed() {
   log "  free attempt failed ($f/$FREE_TRIES)$( (( f >= FREE_TRIES )) && echo " - Claude takes over")"
 }
 # Agents sometimes can't run git commit; commit what they left (respects .gitignore).  <dir> <subject>
+# Untracked files that usually hold secrets are left out of a leftover commit (they stay in the worktree).
+# The push scan only sees text it recognises, so a .netrc or a key file with no token prefix would pass it.
+LEFTOVER_SECRET_GLOBS=('**/.env' '**/.env.*' '**/*.env' '**/*.pem' '**/*.key' '**/*.p12' '**/*.pfx' '**/*.keystore'
+  '**/id_rsa*' '**/id_ed25519*' '**/id_ecdsa*' '**/.netrc' '**/.npmrc' '**/.pypirc' '**/.git-credentials'
+  '**/credentials' '**/credentials.json' '**/*service-account*.json')
 commit_leftovers() {
   [[ -n $(git "${GIT_X[@]}" -C "$1" status --porcelain) ]] || return 0
-  git "${GIT_X[@]}" -C "$1" add -A && git -C "$1" commit -q -m "$2" -m "$TRAILER" && log "  committed the agent's uncommitted changes"
+  # Tracked files still go in: the owner committed them, so changes to them are real work.
+  local ex=() g; for g in "${LEFTOVER_SECRET_GLOBS[@]}"; do ex+=(":(exclude,glob)$g"); done
+  git "${GIT_X[@]}" -C "$1" add -A -- . "${ex[@]}" || return 1
+  git -C "$1" diff --cached --quiet && return 0   # only excluded files changed: nothing to commit
+  git -C "$1" commit -q -m "$2" -m "$TRAILER" && log "  committed the agent's uncommitted changes"
 }
-# Commits since <base-ref> touching PROTECTED_PATHS?  prints the paths
-protected_touched() { git -C "$1" diff --name-only "$2"..HEAD | $GREP -E "$PROTECTED_PATHS"; }
+# emptied_files <dir> <base-ref>: files the commits since <base-ref> leave at 0 bytes, when they had
+# content at the base, or are protected files added empty. Prints them with an "(emptied)" tag.
+# A wipe (every line of a file deleted) reads as a normal edit in a diff; the size check is what catches it.
+emptied_files() {
+  local f old
+  git -C "$1" diff --no-renames --name-only --diff-filter=AM "$2"..HEAD | while IFS= read -r f; do
+    [[ $(git -C "$1" cat-file -s "HEAD:$f" 2>/dev/null) == 0 ]] || continue
+    old=$(git -C "$1" cat-file -s "$2:$f" 2>/dev/null || echo 0)
+    if (( old > 0 )) || printf '%s\n' "$f" | $GREP -qE "$PROTECTED_PATHS"; then printf '%s (emptied)\n' "$f"; fi
+  done
+}
+# Commits since <base-ref> touching PROTECTED_PATHS, or emptying a file (see emptied_files)?  prints them
+# --no-renames: a rename shows both the old and the new path, so moving a protected file out of the way is caught
+protected_touched() {
+  local em f; em=$(emptied_files "$1" "$2")
+  # a protected file that was also emptied is listed once, with its tag
+  { git -C "$1" diff --no-renames --name-only "$2"..HEAD | $GREP -E "$PROTECTED_PATHS"; } | while IFS= read -r f; do
+    $GREP -qxF "$f (emptied)" <<<"$em" || printf '%s\n' "$f"
+  done
+  [[ -n $em ]] && printf '%s\n' "$em"
+  return 0
+}
+pr_protected_files() { # <repo> <n>: the protected files a PR changes (empty: none); fails if GitHub can't list them
+  local files; files=$(gh api --paginate "repos/$OWNER/$1/pulls/$2/files" --jq '.[] | .filename, (.previous_filename // empty)' 2>>"$LOG") || return 1
+  printf '%s\n' "$files" | { $GREP -E "$PROTECTED_PATHS" || true; } | head -n 5 | tr '\n' ' '   # no match is not an error (pipefail)
+}
 
 # ----------------------------------------------------------------- repos ----
 # The bot works in git worktrees made from YOUR local clones (found under LOCAL_ROOTS).
@@ -695,7 +818,8 @@ GIT_AUTH=(-c credential.helper= -c "credential.helper=!gh auth git-credential")
 
 index_clones() { # repo -> local clone path + remote name, refreshed daily
   local f="$STATE/clones.tsv" g d r url
-  [[ -f $f && -n $(find "$f" -mmin -1440 2>/dev/null) ]] && return 0
+  # an empty index (no clones found) is rebuilt next tick, not kept for a day: a clone made today is picked up at once
+  [[ -s $f && -n $(find "$f" -mmin -1440 2>/dev/null) ]] && return 0
   while read -r g; do
     d=${g%/.git}
     for r in $(git -C "$d" remote 2>/dev/null); do
@@ -705,7 +829,9 @@ index_clones() { # repo -> local clone path + remote name, refreshed daily
       fi
     done
   done < <(find "${LOCAL_ROOTS[@]}" -maxdepth 3 -name .git -type d -not -path '*/node_modules/*' \
-             -not -path "$HERE/*" 2>/dev/null) | awk -F'\t' '!seen[tolower($1)]++' > "$f.tmp" && mv "$f.tmp" "$f"
+             -not -path "$HERE/*" 2>/dev/null) | sort -t$'\t' -k2,2 | awk -F'\t' '!seen[tolower($1)]++' > "$f.tmp" && mv "$f.tmp" "$f"
+  # sort: find's order is arbitrary, so with two clones of one repo the pick changed from run to run. Now it is
+  # the first by path, every time.
 }
 
 # prep_worktree <repo> <branch> : fetch, then point $WORKTREES/<repo> (detached) at <branch>.
@@ -795,7 +921,7 @@ prune_run_logs() {
   echo "${old:-0}"
 }
 housekeeping() {
-  local mark="$STATE/housekeep" w repo gd common busy c mb freed=0
+  local mark="$STATE/housekeep" w repo gd common busy c mb freed=0 unpushed
   [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$TODAY" ]] && return 0
   echo "$TODAY" > "$mark"
   busy=$(jq -r '.data.search.nodes[].repository.name' "$STATE/prs.raw.json" 2>/dev/null)
@@ -805,6 +931,9 @@ housekeeping() {
     $GREP -qxF -- "$repo" <<<"$busy" && continue
     gd=$(git -C "$w" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
     [[ -n $(find "$gd/HEAD" "$gd/index" -mtime -"${WT_KEEP_DAYS:-7}" 2>/dev/null) ]] && continue
+    # --force would drop commits no remote has (an agent's detached work): keep such a worktree. A failed check keeps it too.
+    unpushed=$(git -C "$w" rev-list -n1 HEAD --not --remotes 2>/dev/null) || continue
+    if [[ -n $unpushed ]]; then log "  kept the idle $repo worktree: it has commits no remote has"; continue; fi
     common=$(git -C "$w" rev-parse --path-format=absolute --git-common-dir) || continue
     mb=$(excl_mb "$w")
     if git --git-dir="$common" worktree remove --force "$w" 2>/dev/null; then
@@ -898,7 +1027,11 @@ prep_deps() {
   if [[ $(cat "$f" 2>/dev/null) != "$sum" ]] || [[ ! -d $d/node_modules && ! -d $d/.venv ]]; then
     dl="$LOGS/deps-$(date +%F-%H%M%S)-$repo.log"
     log "  installing dependencies (sandboxed): ${steps[*]}"
-    sandbox_for "$d" || return 0
+    if ! sandbox_for "$d" "" deps; then
+      log "  dependency install skipped: its sandbox did not start (see $LOG)"
+      DEPS_NOTE="Installing the dependencies was skipped (the sandbox did not start), so tests may not run."
+      return 0
+    fi
     if run_timed "$DEPS_TIMEOUT" "${SANDBOX[@]}" -- bash -c "set -e; $(printf '%s\n' "${steps[@]}")" </dev/null >"$dl" 2>&1; then
       echo "$sum" > "$f"
     else
@@ -943,6 +1076,9 @@ query($q:String!){search(type:ISSUE,query:$q,first:50){nodes{... on PullRequest{
   comments(last:100){nodes{author{login} createdAt updatedAt body}}
   timelineItems(last:30,itemTypes:[LABELED_EVENT]){nodes{... on LabeledEvent{createdAt label{name}}}}
 }}}}' > "$STATE/prs.raw.json" || return 1
+  # the search reads at most 50 PRs: a full page means some were not looked at this tick (fix62)
+  (( $(jq '.data.search.nodes | length' "$STATE/prs.raw.json" 2>/dev/null || echo 0) >= 50 )) &&
+    log "  warning: the PR search returned 50, its maximum; PRs beyond those were not checked this tick"
   # Branch updates the bot asked GitHub for (land_pr): "<old head> <its commit time> <request time>" per line
   local carry f
   carry=$(for f in "$STATE"/updated/*; do [[ -f $f ]] || continue
@@ -1098,7 +1234,14 @@ request_cr_review() { # <repo> <n> <head>
 
 merge_pr() { # <repo> <n> <head> [merge signature: review decision + reported checks] [base]
   if [[ $AUTO_MERGE != 1 ]]; then   # it waits for you: free its slot, as for the other ready PRs
-    PARKED_COUNT=$((PARKED_COUNT + 1)); add_label "$1" "$2" "$LABEL-ready"; log "  $1#$2 is clean - labelled ready"; return
+    PARKED_COUNT=$((PARKED_COUNT + 1))
+    # label each commit once: every tick re-labelled and re-logged the same PR. A new commit is labelled again.
+    local rf="$STATE/ready/$1-$2"
+    if [[ $(cat "$rf" 2>/dev/null) != "$3" ]]; then
+      log "  $1#$2 is clean - labelled ready"
+      add_label "$1" "$2" "$LABEL-ready" && { mkdir -p "$STATE/ready"; echo "$3" > "$rf"; }
+    fi
+    return
   fi
   log "  merging $1#$2 ($MERGE_METHOD)"
   local err
@@ -1111,7 +1254,12 @@ merge_pr() { # <repo> <n> <head> [merge signature: review decision + reported ch
     log "  gh: $(head -1 <<<"$err" | sed 's/^X //')"
     local why; why=$([[ -n ${5:-} ]] && merge_block_reasons "$1" "$2" "$5")
     [[ -n $why ]] && log "  why: $why"
-    fail "merge of $1#$2 refused" "${why:-branch protection or merge method?} - labelled ready - https://github.com/$OWNER/$1/pull/$2"; add_label "$1" "$2" "$LABEL-ready"
+    # The alert carries GitHub's own reason (the old text was a guess), and repeats are deduplicated per PR:
+    # hyprland-mcp#24 alerted three times in two days for the same refusal.
+    local reason; reason=${why:-$(head -1 <<<"$err" | sed 's/^X //; s/^gh: //')}
+    log "  ERROR: merge of $1#$2 refused ($reason)"
+    notify critical "pr-autopilot: merge of $1#$2 refused" "$reason - labelled ready - https://github.com/$OWNER/$1/pull/$2" "merge-refused $1#$2"
+    add_label "$1" "$2" "$LABEL-ready"
     PARKED_COUNT=$((PARKED_COUNT + 1))
     # Do not retry every tick: wait until the head, the review decision or the set of reported
     # checks changes (e.g. CodeQL results finally arrive), or 6h pass (see review_prs)
@@ -1199,14 +1347,14 @@ prune_pr_state() {
   [[ $DRY_RUN == 1 ]] && return
   local open k f repo n st
   open=$(jq -r '.[] | "\(.repo)-\(.n)"' <<<"$1")
-  for k in $( { /usr/bin/ls "$STATE"/{rounds,crreq,updated,reopened,bodyfix,mergefail,cifix,waiting} 2>/dev/null
+  for k in $( { /usr/bin/ls "$STATE"/{rounds,crreq,updated,reopened,bodyfix,mergefail,cifix,waiting,ready} 2>/dev/null
                 /usr/bin/ls "$STATE/freefail" 2>/dev/null | sed -n 's/^fix-//p'; } | /usr/bin/grep -E '^[A-Za-z0-9._-]+-[0-9]+$' | sort -u); do
     /usr/bin/grep -qxF -- "$k" <<<"$open" && continue
     repo=${k%-*}; n=${k##*-}
     st=$(gh pr view "$n" -R "$OWNER/$repo" --json state --jq .state 2>/dev/null) || continue
     [[ $st == MERGED || $st == CLOSED ]] || continue
     log "  $repo#$n is ${st,,} - clearing its bot state"
-    for f in rounds crreq updated reopened bodyfix mergefail cifix waiting; do rm -f "$STATE/$f/$k"; done
+    for f in rounds crreq updated reopened bodyfix mergefail cifix waiting ready; do rm -f "$STATE/$f/$k"; done
     rm -f "$STATE/freefail/fix-$k" "$STATE/mergefail/$k.why"
   done
 }
@@ -1216,6 +1364,7 @@ prune_pr_state() {
 # CLAUDE_WAIT_HOURS on the same commit the PR is handed to the owner, which also frees its slot.
 wait_handoff() {
   local f="$STATE/waiting/$1-$2" h="" since=0 hrs max=${CLAUDE_WAIT_HOURS:-24}
+  local hrs
   [[ $DRY_RUN == 1 ]] && return 0
   (( max > 0 )) || return 0
   [[ -f $f ]] && read -r h since < "$f"
@@ -1349,6 +1498,12 @@ review_prs() {
       # The repo requires an approving review (ruleset or branch protection). The bot account is
       # the PR author and cannot approve it, so the PR waits for you and frees its slot
       # (2026-11-08: hyprland-mcp#24, protect-master needs 1 approval).
+      elif ! pbad=$(pr_protected_files "$repo" "$n"); then log "  couldn't list the files of $repo#$n; trying next tick"; continue
+      elif [[ -n $pbad ]]; then   # manifests, lockfiles, Dockerfiles, CI: the owner merges these, not the bot
+        PARKED_COUNT=$((PARKED_COUNT + 1))
+        log "  clean, but it changes protected files ($pbad) - labelled ready; not auto-merged; waiting for you"
+        [[ ,$labels, == *",$LABEL-ready,"* ]] || add_label "$repo" "$n" "$LABEL-ready"
+        notify normal "pr-autopilot: $repo#$n needs your review" "Clean, but it changes files the bot doesn't merge on its own ($pbad). Review and merge it yourself: https://github.com/$OWNER/$repo/pull/$n" "protected $repo $n $head"
       elif [[ $rdec == REVIEW_REQUIRED || $rdec == CHANGES_REQUESTED ]]; then
         PARKED_COUNT=$((PARKED_COUNT + 1))
         log "  clean, but $repo requires an approving review ($rdec) - labelled ready; waiting for you"
@@ -1453,11 +1608,14 @@ fix_pr() {
   d=$WT_DIR
   if [[ $(jq -r .mergeable <<<"$pr") == CONFLICTING ]]; then
     if git -C "$d" merge -q --no-edit "$REMOTE/$base" >/dev/null 2>&1; then
-      log "  merged $base cleanly, no Claude needed"; push_wt "$repo" "$branch"; return
+      log "  merged $base cleanly, no Claude needed"
+      push_wt "$repo" "$branch"; rc=$?
+      (( rc == 2 )) && add_label "$repo" "$n" "$LABEL-needs-human" "the bot's merge was blocked: its commits looked like they contained a credential"
+      (( rc )) && return 1
+      record_push "$repo#$n"; return
     fi
     conflict=$(git -C "$d" diff --name-only --diff-filter=U)
   fi
-  echo $(( $(cat "$STATE/rounds/$repo-$n" 2>/dev/null || echo 0) + 1 )) > "$STATE/rounds/$repo-$n"
   prep_deps "$d" "$repo"
 
   local ctx="" id
@@ -1491,7 +1649,8 @@ fix_pr() {
   # (2026-11-09 strathmore#153 "add a --max-minutes budget": round 4 added resumable checkpoints and a
   # migration, and CodeRabbit's next finding was about the checkpoints). Removing the extra code worked
   # where extending it didn't (rhythm-linux#8 round 4: reverted the out-of-scope rollback, both findings gone).
-  local round scope=""; round=$(cat "$STATE/rounds/$repo-$n")
+  # Counted below, once an agent has actually run: a handoff (rc 2/3) doesn't use up a round.
+  local round scope=""; round=$(( $(cat "$STATE/rounds/$repo-$n" 2>/dev/null || echo 0) + 1 ))
   (( round >= 3 )) && scope="
 - This is fix round $round of at most $MAX_FIX_ROUNDS for this PR, and every round so far has drawn new findings. Keep this round small and on the PR's purpose (\"$title\"). If a finding is about code that earlier fix rounds added beyond that purpose, prefer simplifying or removing that code over extending it. Don't add new machinery (storage, migrations, new modes or subsystems) to cover an edge case; a finding that would need it can be declined as out of scope for this PR, saying what a follow-up would need."
   local out rc
@@ -1516,6 +1675,7 @@ EOF
   rc=$?
   (( rc == 2 )) && { free_failed "$key" all; return; }
   (( rc == 3 )) && { log "  will retry with another agent"; return; }
+  echo "$round" > "$STATE/rounds/$repo-$n"   # an attempt that ran counts, even if it gave no usable result
   if [[ -z $out ]]; then
     log "  no structured result (turn limit or error); will retry next round"; free_failed "$key"; return
   fi
@@ -1629,27 +1789,93 @@ pick_repo() { # round-robin over repos.txt (refresh_repos) without an open bot P
 }
 
 discoveries_today() { cat "$STATE/discoveries-$TODAY" 2>/dev/null || echo 0; }
+# give_back_discovery: return this tick's discovery slot, never below zero
+give_back_discovery() { local n; n=$(discoveries_today); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$TODAY"; return 0; }
+# open_pr <repo> <base> <branch> <result-json> <issue>: open the PR for a branch that is already pushed.
+# "Closes #issue" is added only for a real issue number (0 or empty: none).
+open_pr() {
+  local repo=$1 base=$2 branch=$3 out=$4 issue=$5 closes=""
+  [[ $issue =~ ^[1-9][0-9]*$ ]] && closes=$'\n\nCloses #'"$issue"
+  posted PR "$repo" gh pr create -R "$OWNER/$repo" --base "$base" --head "$branch" --label "$LABEL" \
+    --title "$(jq -r .pr_title <<<"$out")" \
+    --body "$(jq -r .pr_body <<<"$out")$closes
+
+$FOOTER"
+}
+# park_pr <repo> <base> <branch> <result-json> <issue>: the branch is on GitHub but its PR could not be
+# opened. Keep what replay_pending_prs needs to open it later, so the work isn't lost or run again.
+# (2026-11-12 diaspora-direct-pay: the branch and issue #1 were pushed, the PR failed, nothing replayed them.)
+park_pr() {
+  local i=${5:-0}; [[ $i =~ ^[0-9]+$ ]] || i=0
+  mkdir -p "$STATE/prs-pending"
+  local f="$STATE/prs-pending/$1-$(date +%F-%H%M%S).json"
+  jq -c --arg r "$1" --arg b "$2" --arg br "$3" --arg e "$ENGINE" --argjson i "$i" \
+    '. + {repo:$r, base:$b, branch:$br, engine:$e, issue_number:$i}' <<<"$4" > "$f"
+  log "  saved the PR for $1 ($3) to open later: $f"
+}
 # publish_pr <repo> <base> <branch> <result-json>: push WT_DIR's HEAD to <branch> and open the PR
-# (plus an issue for it, if the result names none). rc 4 = the push failed (see push_wt), 1 = other.
+# (plus an issue for it, if the result names none). rc 4 = the push failed (see push_wt), 1 = other
+# (the PR failed; its branch and issue are parked for replay_pending_prs), 5 = the text holds a
+# credential, so nothing was pushed or posted.
 publish_pr() {
   local repo=$1 base=$2 branch=$3 out=$4 issue
   local footer=$'\n\n---\n_Opened automatically by pr-autopilot ('"${ENGINE%%:*}"$')._'
   # check everything before anything is pushed or posted, so a blocked result leaves no trace
-  safe_text "PR/issue text" "$repo" "$(jq -r '[.title, .body, .pr_title, .pr_body] | join("\n")' <<<"$out")" || return 1
+  safe_text "PR/issue text" "$repo" "$(jq -r '[.title, .body, .pr_title, .pr_body] | join("\n")' <<<"$out")" || return 5
   push_wt "$repo" "$branch" || return 4
   record_push "$repo:$branch"
   issue=$(jq -r '.issue_number // 0' <<<"$out")
   if [[ $issue == 0 || $issue == null ]]; then
     issue=$(posted issue "$repo" gh issue create -R "$OWNER/$repo" --title "$(jq -r .title <<<"$out")" \
-              --body "$(jq -r .body <<<"$out")$footer" --label "$LABEL" | $GREP -oE '[0-9]+$')
+              --body "$(jq -r .body <<<"$out")$footer" --label "$LABEL" | $GREP -oE '[0-9]+$' || true)
+    [[ -n $issue ]] || log "  no issue number from gh; the PR won't say Closes"
   fi
-  posted PR "$repo" gh pr create -R "$OWNER/$repo" --base "$base" --head "$branch" --label "$LABEL" \
-    --title "$(jq -r .pr_title <<<"$out")" \
-    --body "$(jq -r .pr_body <<<"$out")${issue:+
+  open_pr "$repo" "$base" "$branch" "$out" "$issue" || { park_pr "$repo" "$base" "$branch" "$out" "$issue"; return 1; }
+}
 
-Closes #$issue}
-
-$FOOTER" || return 1
+# replay_pending_prs: open the PRs park_pr saved (their branch is already on GitHub). No agent runs and
+# no discovery turn is used. One open bot PR per repo at a time, as everywhere else.
+PENDING_DAYS=7
+# shelve_pending <record> <why>: stop replaying a record; keep it for the owner in prs-pending/stale
+shelve_pending() {
+  mkdir -p "$STATE/prs-pending/stale"; mv -f "$1" "$STATE/prs-pending/stale/"; rm -f "${1%.json}.tried"
+  notify normal "pr-autopilot: branch pushed, no PR" "$2. The record is in $STATE/prs-pending/stale/" "stale-pr $1"
+}
+replay_pending_prs() {
+  [[ -e $HERE/PAUSE || $DRY_RUN == 1 ]] && return 0
+  local j out repo base branch issue busy existing berr
+  busy=$(jq -r '.data.search.nodes[].repository.name' "$STATE/prs.raw.json" 2>/dev/null)
+  while read -r j; do
+    [[ -n $j ]] || continue
+    out=$(cat "$j"); repo=$(jq -r .repo <<<"$out"); base=$(jq -r .base <<<"$out")
+    branch=$(jq -r .branch <<<"$out"); issue=$(jq -r .issue_number <<<"$out")
+    if [[ -n $(find "$j" -mmin +$((PENDING_DAYS * 1440))) ]]; then
+      shelve_pending "$j" "$repo ($branch) still has no PR after $PENDING_DAYS days"; continue
+    fi
+    $GREP -qxF -- "$repo" <<<"$busy" && continue
+    [[ -n $(find "${j%.json}.tried" -mmin -360 2>/dev/null) ]] && continue   # its PR failed <6h ago
+    existing=$(gh pr list -R "$OWNER/$repo" --head "$branch" --state all --json number --jq length 2>/dev/null)
+    if (( ${existing:-0} > 0 )); then   # a PR for this branch exists already (opened by hand, or by a retry)
+      mkdir -p "$STATE/prs-pending/done"; mv -f "$j" "$STATE/prs-pending/done/"; rm -f "${j%.json}.tried"; continue
+    fi
+    # a branch deleted on GitHub (404) or an issue closed since can't make the PR the owner expects: shelve it
+    if ! berr=$(gh api "repos/$OWNER/$repo/git/ref/heads/$branch" 2>&1 >/dev/null); then
+      if [[ $berr == *"HTTP 404"* ]]; then shelve_pending "$j" "$repo's branch $branch is gone"
+      else touch "${j%.json}.tried"; fi   # any other error: try again in 6h
+      continue
+    fi
+    if [[ $issue =~ ^[1-9][0-9]*$ ]] && [[ $(gh issue view "$issue" -R "$OWNER/$repo" --json state --jq .state 2>/dev/null) == CLOSED ]]; then
+      shelve_pending "$j" "issue #$issue was closed since"; continue
+    fi
+    ENGINE=$(jq -r '.engine // "unknown:unknown"' <<<"$out"); set_attribution
+    log "opening the PR for $repo ($branch), saved earlier"
+    if open_pr "$repo" "$base" "$branch" "$out" "$issue"; then
+      mkdir -p "$STATE/prs-pending/done"; mv -f "$j" "$STATE/prs-pending/done/"; rm -f "${j%.json}.tried"
+    else
+      touch "${j%.json}.tried"
+    fi
+  done < <(ls -t "$STATE"/prs-pending/*.json 2>/dev/null)
+  return 0
 }
 
 # A discovery whose push failed left its commits (state/unpushed/X.patch) and its result (X.json).
@@ -1692,10 +1918,23 @@ replay_unpushed() {
     if (( rc == 4 )); then   # still can't push: keep the original pair, drop push_wt's new copy
       [[ -n $UNPUSHED ]] && rm -f "$UNPUSHED"; touch "${j%.json}.tried"; return 0
     fi
+    # the text was blocked before anything was pushed: this work was never published, so keep it for the owner
+    if (( rc == 5 )); then shelve "its PR text contains a credential, so nothing was posted"; continue; fi
     mkdir -p "$STATE/unpushed/done"; mv -f "$j" "$p" "$STATE/unpushed/done/"; rm -f "${j%.json}.tried"
     return 0
   done < <(ls -t "$STATE"/unpushed/*.json 2>/dev/null)
   return 1
+}
+
+# issue_lists <repo>: sets ISSUES_MINE and ISSUES_OTHERS for discovery's prompt.
+# ISSUES_MINE: the owner's open issues offered as tasks; skip-labelled ones are dropped before the cap of 15.
+# ISSUES_OTHERS: the 40 newest issues. The owner's keep their titles; strangers' show number and state only,
+# because their text is untrusted and must not reach an agent (fix61).
+issue_lists() {
+  ISSUES_MINE=$(gh issue list -R "$OWNER/$1" --state open --author "$OWNER" --limit 100 --json number,title,body,labels \
+    --jq '[.[] | select([.labels[].name] | (index("autopilot-skip") or index("autopilot-needs-human")) | not)] | .[0:15][] | "### #\(.number): \(.title)\n\(.body[0:1500])\n"')
+  ISSUES_OTHERS=$(gh issue list -R "$OWNER/$1" --state all --limit 40 --json number,title,state,author \
+    --jq ".[] | if .author.login == \"$OWNER\" then \"- #\(.number) [\(.state)] \(.title[0:100])\" else \"- #\(.number) [\(.state)] (opened by someone else; title withheld)\" end")
 }
 
 discover() { # <repo>
@@ -1710,7 +1949,7 @@ discover() { # <repo>
   # GitHub didn't answer: give back the scan and today's slot instead of a "worktree setup failed"
   # alert for a branch named "" (or "null")
   if [[ -z $base ]]; then
-    rm -f "$STATE/scanned/$repo"; echo $(( $(discoveries_today) - 1 )) > "$STATE/discoveries-$TODAY"
+    rm -f "$STATE/scanned/$repo"; give_back_discovery
     log "  couldn't read $repo's default branch from GitHub; trying again next tick"; return 1
   fi
   branch="$LABEL/$(date +%Y%m%d-%H%M)"
@@ -1720,10 +1959,7 @@ discover() { # <repo>
 
   # Only the owner's own issues are offered as tasks (public repos: strangers' issue text is untrusted)
   local mine others
-  mine=$(gh issue list -R "$OWNER/$repo" --state open --author "$OWNER" --limit 15 --json number,title,body,labels \
-          --jq '.[] | select([.labels[].name] | (index("autopilot-skip") or index("autopilot-needs-human")) | not) | "### #\(.number): \(.title)\n\(.body[0:1500])\n"')
-  others=$(gh issue list -R "$OWNER/$repo" --state all --limit 40 --json number,title,state \
-          --jq '.[] | "- #\(.number) [\(.state)] \(.title[0:100])"')
+  issue_lists "$repo"; mine=$ISSUES_MINE; others=$ISSUES_OTHERS
 
   local out rc
   out=$(run_agent "$d" "$DISCOVER_SCHEMA" "$key" <<EOF
@@ -1766,7 +2002,7 @@ EOF
   }
   (( rc == 2 )) && { retry all; return; }
   if (( rc == 3 )); then   # agent outage: give back the scan and today's discovery slot
-    rm -f "$STATE/scanned/$repo"; echo $(( $(discoveries_today) - 1 )) > "$STATE/discoveries-$TODAY"
+    rm -f "$STATE/scanned/$repo"; give_back_discovery
     log "  will retry with another agent"; return
   fi
   [[ -z $out ]] && { log "  no structured result"; retry; return; }
@@ -1885,6 +2121,7 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
     log "fix waiting for $fr#$fn: $WHY"
     wait_handoff "$fr" "$fn" "$(jq -r .head <<<"$fpr")" "$WHY"
   done
+  replay_pending_prs   # PRs whose branch is pushed but whose PR failed (no agent, no discovery turn)
   if (( fixed )); then :
   # Parked PRs (needs-human, stuck, ready but not mergeable by the bot) wait on the owner, so they don't hold a slot; a backlog of
   # 2x MAX_OPEN_PRS open bot PRs still stops new work.
@@ -1973,7 +2210,7 @@ agy_models() {
   command -v agy >/dev/null && [[ -d $AGENT_DATA/keyrings ]] || return 0
   ( t="$STATE/agy-login"; [[ -d $t/.git ]] || { mkdir -p "$t"; git -C "$t" init -q; }
     agent_config; sandbox_for "$t" || exit 0
-    run_timed 90s "${SANDBOX[@]}" --setenv XDG_RUNTIME_DIR /tmp/rt -- "${AGY_KEYRING[@]}" agy models </dev/null 2>/dev/null |
+    run_timed 90s "${SANDBOX[@]}" --setenv XDG_RUNTIME_DIR /tmp/rt -- "${EGRESS_RUN[@]}" "${AGY_KEYRING[@]}" agy models </dev/null 2>/dev/null |
       awk -F'\t' '$1 ~ /^[a-z0-9][a-z0-9.-]+$/ && NF >= 2 { print "agy:" $1 }' )
 }
 # list_free_models: every free agent:model the installed CLIs offer, minus FREE_SKIP (cached a day)
@@ -2232,9 +2469,9 @@ Run the tests again to confirm, then commit your fix with: git commit -am "Fix s
   TT_EV=$(/usr/bin/ls -t "$LOGS/${spec%%:*}-"*"-trial-$task.jsonl" 2>/dev/null | head -1)
   [[ -n $TT_EV ]] && TT_LEAK=$(leak_check "$TT_EV" "$canary")
   # grade: the model's code against the ORIGINAL tests, in the sandbox (its code is untrusted)
-  if [[ $task == easy ]]; then cp "$t/calc.py" "$g/calc.py" 2>/dev/null; else cp -rP "$t/shop" "$g/" 2>/dev/null; fi
+  if [[ $task == easy ]]; then cp -P "$t/calc.py" "$g/calc.py" 2>/dev/null; else cp -rP "$t/shop" "$g/" 2>/dev/null; fi   # -P: a symlink is copied as a link, never followed out of the trial dir
   git -C "$t" show "$base:$tfile" > "$g/$tfile"
-  res=""; sandbox_for "$g" && res=$(timeout 120 "${SANDBOX[@]}" -- python3 -m pytest -q -p no:cacheprovider </dev/null 2>&1 | tail -n 3)
+  res=""; sandbox_for "$g" && res=$(timeout 120 "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" python3 -m pytest -q -p no:cacheprovider </dev/null 2>&1 | tail -n 3)
   [[ $res =~ ([0-9]+)\ passed ]] && passed=${BASH_REMATCH[1]}
   [[ $res =~ [0-9]+\ passed && ! $res =~ failed|error ]] && TT_PASS=true
   # JSON only after a follow-up ("you ended without the result") is worth less: 2026-11-09 dots-3 needed one
@@ -2470,6 +2707,10 @@ config_errors() {
   [[ ${OWNER-} =~ ^[A-Za-z0-9-]+$ ]] || echo "OWNER is \"${OWNER-}\", not a GitHub login"
   [[ ${MERGE_METHOD-} =~ ^(squash|merge|rebase)$ ]] || echo "MERGE_METHOD is \"${MERGE_METHOD-}\", not squash, merge or rebase"
   [[ ${REQUIRE_CLAUDE_REVIEW-} =~ ^(auto|always|never)$ ]] || echo "REQUIRE_CLAUDE_REVIEW is \"${REQUIRE_CLAUDE_REVIEW-}\", not auto, always or never"
+  # DIGEST_HOUR is optional (unset = no digest), but a bad value silently never sends the digest
+  if [[ -n ${DIGEST_HOUR:-} ]]; then
+    [[ $DIGEST_HOUR =~ ^[0-9]{1,2}$ ]] && (( 10#$DIGEST_HOUR <= 23 )) || echo "DIGEST_HOUR is \"$DIGEST_HOUR\", not an hour (0-23)"
+  fi
   return 0
 }
 
@@ -2507,8 +2748,8 @@ doctor() {
   d_warn() { printf '  WARN  %s\n' "$1"; }
   d_fail() { printf '  FAIL  %s\n' "$1"; bad=1; }
   echo "pr-autopilot $(bot_version)"
-  x=""; for t in git gh jq bwrap curl flock timeout; do command -v "$t" >/dev/null || x+=" $t"; done
-  if [[ -z $x ]]; then d_ok "tools installed (git gh jq bwrap curl flock timeout)"; else d_fail "missing tools:$x"; fi
+  x=""; for t in git gh jq bwrap curl flock timeout tinyproxy socat; do command -v "$t" >/dev/null || x+=" $t"; done
+  if [[ -z $x ]]; then d_ok "tools installed (git gh jq bwrap curl flock timeout tinyproxy socat)"; else d_fail "missing tools:$x"; fi
   x=$(config_errors)
   if [[ -z $x ]]; then d_ok "config.sh settings are valid"; else while read -r t; do d_fail "config.sh: $t"; done <<<"$x"; fi
   [[ $(bot_version) == *-dirty ]] && d_warn "autopilot.sh or config.sh has edits that are not committed (install with install.sh)"
@@ -2572,6 +2813,18 @@ doctor() {
   return $bad
 }
 
+# set_ntfy_token: save the access token for a private topic (input hidden; state/ntfy-auth, owner-only).
+set_ntfy_token() {
+  local t
+  echo "Paste the ntfy access token for your private topic (tk_..., input is hidden):"
+  IFS= read -rs t; echo
+  [[ $t =~ ^tk_[A-Za-z0-9]{20,}$ ]] || { echo "That doesn't look like an ntfy access token (tk_...). Nothing saved."; return 1; }
+  mkdir -p "$STATE"
+  (umask 077; printf 'Authorization: Bearer %s\n' "$t" > "$NTFY_AUTH_FILE.new") && mv "$NTFY_AUTH_FILE.new" "$NTFY_AUTH_FILE" || { echo "Could not save it."; return 1; }
+  echo "Saved to $NTFY_AUTH_FILE (only you can read it; state/ is never committed)."
+  notify normal "pr-autopilot: test notification" "Phone alerts now use a private topic. $(date '+%F %T')" "test-$EPOCHSECONDS"
+  echo "Sent a test alert to the topic."
+}
 # set_ntfy_topic: save the phone-alert topic outside the repo. Empty input makes a random one.
 set_ntfy_topic() {
   local t made=0
@@ -2657,7 +2910,7 @@ running $(bot_version); journalctl --user -u pr-autopilot" "tick-crashed" ;;
   agy-login) # sign agy in for the bot only, inside its sandbox (your own agy login is not used or touched)
     command -v agy >/dev/null || { echo "agy is not installed"; exit 1; }
     t="$STATE/agy-login"; [[ -d $t/.git ]] || { mkdir -p "$t"; git -C "$t" init -q; }
-    agent_config; sandbox_for "$t" || { echo "sandbox setup failed"; exit 1; }
+    agent_config; sandbox_for "$t" "" net || { echo "sandbox setup failed"; exit 1; }
     sb=(); for a in "${SANDBOX[@]}"; do [[ $a == --new-session ]] || sb+=("$a"); done   # keep the terminal
     if (( $# > 1 )); then shift; "${sb[@]}" --setenv XDG_RUNTIME_DIR /tmp/rt -- "${AGY_KEYRING[@]}" agy "$@"; exit $?; fi
     echo "Starting agy inside the bot's sandbox. Sign in with the Google account the bot should use"
@@ -2678,7 +2931,7 @@ running $(bot_version); journalctl --user -u pr-autopilot" "tick-crashed" ;;
     echo "Saved to $f (only you and the bot's sandbox can read it). Testing it inside the sandbox (one tiny call)..."
     t="$STATE/vibe-login"; [[ -d $t/.git ]] || { mkdir -p "$t"; git -C "$t" init -q; }
     agent_config; sandbox_for "$t" || { echo "sandbox setup failed"; exit 1; }
-    if "${SANDBOX[@]}" -- timeout 120 vibe -p "Reply with just: ok" --output text --max-turns 1 --trust 2>&1 | tee /dev/stderr | $GREP -qiE '\bok\b'; then
+    if "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" timeout 120 vibe -p "Reply with just: ok" --output text --max-turns 1 --trust 2>&1 | tee /dev/stderr | $GREP -qiE '\bok\b'; then
       echo "OK: the bot's vibe works."
     else echo "The test call did not answer ok (see above). Check the key, or that the free plan is active."; exit 1; fi ;;
   set-claude-token) # save the bot's own Claude login (from `claude setup-token`) and test it in the sandbox
@@ -2689,16 +2942,17 @@ running $(bot_version); journalctl --user -u pr-autopilot" "tick-crashed" ;;
     echo "Saved to $CLAUDE_TOKEN_FILE (only you can read it). Testing it inside the sandbox (one tiny Haiku call)..."
     t="$STATE/tokentest"; rm -rf "$t"; mkdir -p "$t"; git -C "$t" init -q
     sandbox_for "$t" claude || { echo "sandbox setup failed"; exit 1; }
-    u=$(echo "Reply with just: ok" | timeout 120 "${SANDBOX[@]}" -- claude -p --model haiku --max-turns 1 \
+    u=$(echo "Reply with just: ok" | timeout 120 "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" claude -p --model haiku --max-turns 1 \
           --output-format stream-json --verbose --tools "" "${CLAUDE_COMMON[@]}" 3<"$CLAUDE_TOKEN_FILE" 2>&1 | tee "$LOGS/tokentest.jsonl" | parse_rate)
     rm -rf "$t"
     if [[ -n $u ]]; then echo "$u" > "$STATE/usage.json"; jq -r '"Works. Plan usage now: 5h \(.five*100|floor)%, week \(.seven*100|floor)%"' <<<"$u"
     else echo "The test call failed; see $LOGS/tokentest.jsonl"; exit 1; fi ;;
-  set-ntfy-topic) set_ntfy_topic ;;   # save the phone-alert topic in state/ (not in the repo) and send a test alert
+  set-ntfy-topic) set_ntfy_topic ;;
+  set-ntfy-token) set_ntfy_token ;;   # save the phone-alert topic in state/ (not in the repo) and send a test alert
   signing-key) signing_key ;;   # make (once) and show the bot's commit signing key
   cleanup) rm -f "$STATE/housekeep"; housekeeping; echo "done (see $LOG)" ;;   # run the daily disk cleanup now
   notify-test) notify normal "pr-autopilot: test notification" "Notifications work. $(date '+%F %T')" "test-$(date +%s)" ;;
-  *) echo "usage: $0 [tick|status|doctor|version|models|trial [model|all|new]|usage|selftest|signing-key|cleanup|notify-test|set-claude-token|set-ntfy-topic|agy-login|set-mistral-key]"; exit 2 ;;
+  *) echo "usage: $0 [tick|status|doctor|version|models|trial [model|all|new]|usage|selftest|signing-key|cleanup|notify-test|set-claude-token|set-ntfy-topic|set-ntfy-token|agy-login|set-mistral-key]"; exit 2 ;;
 esac
 }
 main "$@"; exit $?
