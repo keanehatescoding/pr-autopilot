@@ -54,6 +54,7 @@ untracked=$(git ls-files --others --exclude-standard | head -5 | tr '\n' ' ')
 if [[ $mode != rollback ]]; then
   echo "install: running tests/run.sh on $cand"
   tests/run.sh "$(realpath "$cand")" | tail -15 || die "tests failed; nothing installed"
+  [[ -x tests/install_test.sh ]] && { tests/install_test.sh | tail -10 || die "install tests failed; nothing installed"; }
 fi
 if [[ $mode == check ]]; then idle && echo "install: checks passed; it would install as $tag"; exit; fi
 

@@ -270,11 +270,10 @@ budget_ok() {
 # rc = the command's, 124 on timeout, or 250 if it was stopped after a suspend.
 # If RUN_WATCH names a command, it is also run every 15s; when it succeeds the run is stopped (rc 251).
 SLEPT_RC=250 STUCK_RC=251
-ACTIVE_TIMED_PID=
 run_timed() {
   local limit=$1 pid w rc; shift
   timeout -k 15s "$limit" "$@" <&0 & pid=$!   # <&0: a background job would otherwise get /dev/null as stdin
-  ACTIVE_TIMED_PID=$pid
+  echo "$pid" > "$STATE/active-pid"
   ( s=""; trap '[[ -n $s ]] && kill "$s" 2>/dev/null; exit 0' TERM
     last=$EPOCHSECONDS
     while :; do
@@ -284,7 +283,7 @@ run_timed() {
       last=$EPOCHSECONDS
     done ) </dev/null >/dev/null 2>&1 3<&- & w=$!
   wait "$pid"; rc=$?
-  ACTIVE_TIMED_PID=
+  rm -f "$STATE/active-pid"
   kill -TERM "$w" 2>/dev/null; wait "$w"
   case $? in 99) return $SLEPT_RC ;; 98) return $STUCK_RC ;; esac
   return $rc
@@ -2135,7 +2134,9 @@ tick() {
   exec 9>"$STATE/lock"; flock -n 9 || { log "previous tick still running"; exit 0; }
   IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
   on_tick_abort() {
-    [[ -n ${ACTIVE_TIMED_PID:-} ]] && kill -TERM "$ACTIVE_TIMED_PID" 2>/dev/null || true
+    local apid; apid=$(cat "$STATE/active-pid" 2>/dev/null)
+    [[ -n $apid ]] && kill -TERM "$apid" 2>/dev/null || true
+    rm -f "$STATE/active-pid"
     if [[ -n ${IN_FLIGHT_SCANNED:-} ]]; then
       rm -f "$IN_FLIGHT_SCANNED"
       if [[ -n ${IN_FLIGHT_DISC_DAY:-} ]]; then
