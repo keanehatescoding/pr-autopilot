@@ -20,6 +20,16 @@ DRY_RUN="${DRY_RUN:-0}"
 LABEL="autopilot"
 NOW=$(date +%s); TODAY=$(date +%F)
 LOG="$LOGS/$TODAY.log"
+TODAY_START=$TODAY
+LOG_START=$LOG
+today() {
+  if [[ ${TODAY:-$TODAY_START} != "$TODAY_START" ]]; then printf '%s' "$TODAY"
+  else date +%F; fi
+}
+log_file() {
+  if [[ ${LOG:-$LOG_START} != "$LOG_START" ]]; then printf '%s' "$LOG"
+  else printf '%s/%s.log' "$LOGS" "$(today)"; fi
+}
 GREP=/usr/bin/grep   # avoid shell grep aliases
 # The ntfy topic is a secret (whoever knows it can read the alerts), so it lives in state/ like the
 # tokens, not in the tracked config.sh. Set it with: autopilot.sh set-ntfy-topic
@@ -41,7 +51,7 @@ NTFY_AUTH_FILE="$STATE/ntfy-auth"
 export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
        GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
 
-log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$(log_file)" >&2; }
 # Which install is running: the fixN tag install.sh made, "+N" commits after it, and "-dirty" when
 # autopilot.sh or config.sh differs from the commit (edited by hand, or installed but not committed).
 # --no-optional-locks: never write the repo's index from a tick.
@@ -100,7 +110,7 @@ flush_ntfy() { # resend queued phone pushes; drop ones older than 12h
 }
 fail() { # <what went wrong> [detail]   log + critical notification
   log "  ERROR: $1${2:+ ($2)}"
-  notify critical "pr-autopilot: $1" "${2:-see ~/pr-autopilot/logs/$TODAY.log}"
+  notify critical "pr-autopilot: $1" "${2:-see ~/pr-autopilot/logs/$(today).log}"
 }
 # Secret scan: nothing that looks like a credential is ever posted to GitHub or pushed.
 # Matches common token formats plus the exact values of your own local logins.
@@ -112,6 +122,8 @@ known_secrets() { # one per line; never logged
       [[ -f $f ]] && jq -r '.. | strings' "$f" 2>/dev/null
     done
     [[ -f $CLAUDE_TOKEN_FILE ]] && cat "$CLAUDE_TOKEN_FILE"; echo
+    [[ -f $NTFY_TOPIC_FILE ]] && head -n 1 "$NTFY_TOPIC_FILE" 2>/dev/null; echo
+    [[ -f $NTFY_AUTH_FILE ]] && sed -nE 's/^[Aa]uthorization:[[:space:]]*([Bb]earer|[Bb]asic)[[:space:]]+//p' "$NTFY_AUTH_FILE" 2>/dev/null; echo
     # the bot's own Mistral key: sandboxed agents can read it, and it has no prefix SECRET_RE knows
     if [[ -f $STATE/agent-home/.vibe/.env ]]; then
       if command -v python3 >/dev/null; then
@@ -153,7 +165,7 @@ safe_text() { # <what> <where> <text>: 0 if it may be posted; otherwise alerts a
 posted() {
   local what=$1 repo=$2 url; shift 2
   safe_text "$what" "$repo" "$*" || return 1
-  if url=$("$@" 2>>"$LOG") && [[ -n $url ]]; then log "  $url"; echo "$url"
+  if url=$("$@" 2>>"$(log_file)") && [[ -n $url ]]; then log "  $url"; echo "$url"
   else fail "could not create the $what in $repo"; return 1; fi
 }
 gh_w() { # GitHub write action; skipped in dry run
@@ -167,7 +179,7 @@ in_window() {
   if (( WINDOW_START < WINDOW_END )); then (( h >= WINDOW_START && h < WINDOW_END ))
   else (( h >= WINDOW_START || h < WINDOW_END )); fi
 }
-runs_today() { cat "$STATE/runs-$TODAY" 2>/dev/null || echo 0; }
+runs_today() { cat "$STATE/runs-$(today)" 2>/dev/null || echo 0; }
 
 # ---------------------------------------------------------------- budget ----
 CLAUDE_COMMON=(--strict-mcp-config --setting-sources project --no-session-persistence)
@@ -221,13 +233,14 @@ budget_ok() {
   fi
   [[ -n $u ]] || { WHY="could not read plan usage (failing safe)"; return 1; }
   # first reading of the day = baseline for DAILY_MAX
-  [[ -s $STATE/daystart-$TODAY ]] || jq -r .seven <<<"$u" > "$STATE/daystart-$TODAY"
+  local d; d=$(today)
+  [[ -s $STATE/daystart-$d ]] || jq -r .seven <<<"$u" > "$STATE/daystart-$d"
   # The verdict is "ok" or the reason. Anything else blocks: before 2026-11-10 an empty answer meant
   # "allowed", so a jq error (a non-numeric config value, an empty daystart file, a reading without
   # its numbers) let Claude run with no budget check at all.
   local verdict
   verdict=$(jq -r --argjson now "$NOW" --argjson wt "${WEEK_TARGET:-x}" --argjson dm "${DAILY_MAX:-x}" \
-          --argjson fm "${FIVE_HOUR_MAX:-x}" --argjson base "$(cat "$STATE/daystart-$TODAY" 2>/dev/null)" '
+          --argjson fm "${FIVE_HOUR_MAX:-x}" --argjson base "$(cat "$STATE/daystart-$d" 2>/dev/null)" '
     def pct: . * 100 | floor | tostring + "%";
     if ([.five, .seven, .seven_reset, $base, $wt, $dm, $fm] | all(type == "number")) | not
       then "the usage reading or a budget setting is not a number (failing safe)"
@@ -257,9 +270,11 @@ budget_ok() {
 # rc = the command's, 124 on timeout, or 250 if it was stopped after a suspend.
 # If RUN_WATCH names a command, it is also run every 15s; when it succeeds the run is stopped (rc 251).
 SLEPT_RC=250 STUCK_RC=251
+ACTIVE_TIMED_PID=
 run_timed() {
   local limit=$1 pid w rc; shift
-  timeout "$limit" "$@" <&0 & pid=$!   # <&0: a background job would otherwise get /dev/null as stdin
+  timeout -k 15s "$limit" "$@" <&0 & pid=$!   # <&0: a background job would otherwise get /dev/null as stdin
+  ACTIVE_TIMED_PID=$pid
   ( s=""; trap '[[ -n $s ]] && kill "$s" 2>/dev/null; exit 0' TERM
     last=$EPOCHSECONDS
     while :; do
@@ -269,6 +284,7 @@ run_timed() {
       last=$EPOCHSECONDS
     done ) </dev/null >/dev/null 2>&1 3<&- & w=$!
   wait "$pid"; rc=$?
+  ACTIVE_TIMED_PID=
   kill -TERM "$w" 2>/dev/null; wait "$w"
   case $? in 99) return $SLEPT_RC ;; 98) return $STUCK_RC ;; esac
   return $rc
@@ -283,14 +299,14 @@ run_claude() {
   out="$LOGS/claude-$(date +%F-%H%M%S)-$tag.jsonl"
   [[ -s $CLAUDE_TOKEN_FILE ]] || { fail "Claude has no bot token" "run: ~/pr-autopilot/autopilot.sh set-claude-token"; return 1; }
   sandbox_for "$dir" claude || { fail "sandbox setup failed for $tag"; return 1; }
-  echo $(( $(runs_today) + 1 )) > "$STATE/runs-$TODAY"
+  echo $(( $(runs_today) + 1 )) > "$STATE/runs-$(today)"
   log "  starting Claude ($MODEL, run $(runs_today) today, sandboxed): $tag"
   run_timed "$RUN_TIMEOUT" "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" claude -p --model "$MODEL" --max-turns "$MAX_TURNS" \
       --output-format stream-json --verbose --json-schema "$schema" \
       --tools "$RUN_TOOLS" \
       --permission-mode dontAsk --allowedTools "${ALLOWED_TOOLS[@]}" \
       --disallowedTools "Bash(git push:*)" "Bash(gh:*)" WebFetch WebSearch \
-      "${CLAUDE_COMMON[@]}" 3<"$CLAUDE_TOKEN_FILE" > "$out" 2>>"$LOG"
+      "${CLAUDE_COMMON[@]}" 3<"$CLAUDE_TOKEN_FILE" > "$out" 2>>"$(log_file)"
   local rc=$?
   # The run's own transcript carries a fresh usage reading: keep it so the next tick can skip the probe.
   local u; u=$(parse_rate < "$out"); [[ -n $u ]] && echo "$u" > "$STATE/usage.json"
@@ -300,7 +316,7 @@ run_claude() {
   # only the plan's own wording: a turn-limit error ("limit" alone matched it) must not pause Claude for the day
   if [[ $(jq -r '.is_error // false' <<<"$res") == true && $(jq -r '.subtype // ""' <<<"$res") != error_max_turns ]] &&
      jq -r '.result // ""' <<<"$res" | $GREP -qiE 'usage limit|plan limit|limit reached'; then
-    fail "Claude plan limit hit" "Claude runs paused for today; free agents keep going"; echo "$MAX_RUNS_PER_DAY" > "$STATE/runs-$TODAY"
+    fail "Claude plan limit hit" "Claude runs paused for today; free agents keep going"; echo "$MAX_RUNS_PER_DAY" > "$STATE/runs-$(today)"
   fi
   jq -c '.structured_output // (.result | try fromjson catch empty) // empty' <<<"$res" 2>/dev/null
 }
@@ -944,9 +960,10 @@ prune_run_logs() {
   echo "${old:-0}"
 }
 housekeeping() {
-  local mark="$STATE/housekeep" w repo gd common busy c mb freed=0 unpushed
-  [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$TODAY" ]] && return 0
-  echo "$TODAY" > "$mark"
+  local mark="$STATE/housekeep" d w repo gd common busy c mb freed=0 unpushed
+  d=$(today)
+  [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$d" ]] && return 0
+  echo "$d" > "$mark"
   busy=$(jq -r '.data.search.nodes[].repository.name' "$STATE/prs.raw.json" 2>/dev/null)
   for w in "$WORKTREES"/*; do
     repo=${w##*/}
@@ -972,6 +989,10 @@ housekeeping() {
     freed=$((freed + mb)); log "  emptied the agents' ${c##*/} download cache (${mb}M)"
   done
   find "$STATE/grades" -maxdepth 1 -type f -mtime +30 -delete 2>/dev/null
+  ls -1t "$STATE"/autopilot.sh.bak* 2>/dev/null | tail -n +16 | xargs -r rm -f --
+  if [[ -f $AGENT_DATA/opencode/opencode.db ]] && command -v sqlite3 >/dev/null; then
+    sqlite3 "$AGENT_DATA/opencode/opencode.db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null 2>&1 || true
+  fi
   mb=$(prune_run_logs); freed=$((freed + ${mb:-0}))
   (( freed )) && log "housekeeping freed ${freed}M"
   return 0
@@ -1831,9 +1852,9 @@ pick_repo() { # round-robin over repos.txt (refresh_repos) without an open bot P
   return 1
 }
 
-discoveries_today() { cat "$STATE/discoveries-$TODAY" 2>/dev/null || echo 0; }
+discoveries_today() { cat "$STATE/discoveries-$(today)" 2>/dev/null || echo 0; }
 # give_back_discovery: return this tick's discovery slot, never below zero
-give_back_discovery() { local n; n=$(discoveries_today); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$TODAY"; return 0; }
+give_back_discovery() { local n; n=$(discoveries_today); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$(today)"; return 0; }
 # open_pr <repo> <base> <branch> <result-json> <issue>: open the PR for a branch that is already pushed.
 # "Closes #issue" is added only for a real issue number (0 or empty: none).
 open_pr() {
@@ -1984,19 +2005,22 @@ discover() { # <repo>
   local repo=$1 key="discover-$1"
   log "looking for work in $repo with ${ENGINE%%:*}"
   [[ $DRY_RUN == 1 ]] && { log "  DRY-RUN: would run $ENGINE discovery in $repo"; return; }
+  local disc_day; disc_day=$(today)
   echo "$NOW" > "$STATE/scanned/$repo"
-  echo $(( $(discoveries_today) + 1 )) > "$STATE/discoveries-$TODAY"
+  echo $(( $(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0) + 1 )) > "$STATE/discoveries-$disc_day"
+  IN_FLIGHT_SCANNED="$STATE/scanned/$repo"
+  IN_FLIGHT_DISC_DAY="$disc_day"
   local d base branch info disc_ok
   info=$(gh repo view "$OWNER/$repo" --json defaultBranchRef,hasDiscussionsEnabled 2>/dev/null)
   base=$(jq -r '.defaultBranchRef.name // empty' <<<"$info" 2>/dev/null); disc_ok=$(jq -r .hasDiscussionsEnabled <<<"$info" 2>/dev/null)
   # GitHub didn't answer: give back the scan and today's slot instead of a "worktree setup failed"
   # alert for a branch named "" (or "null")
   if [[ -z $base ]]; then
-    rm -f "$STATE/scanned/$repo"; give_back_discovery
+    rm -f "$STATE/scanned/$repo"; give_back_discovery; IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
     log "  couldn't read $repo's default branch from GitHub; trying again next tick"; return 1
   fi
   branch="$LABEL/$(date +%Y%m%d-%H%M)"
-  prep_worktree "$repo" "$base" || { fail "worktree setup failed for $repo"; return 1; }
+  prep_worktree "$repo" "$base" || { IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=; fail "worktree setup failed for $repo"; return 1; }
   d=$WT_DIR
   prep_deps "$d" "$repo"
 
@@ -2035,6 +2059,7 @@ ${others:-(none)}
 EOF
 )
   rc=$?
+  IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
   # a failed free attempt leaves the repo unscanned so it is retried (by Claude after FREE_TRIES).
   # It also gives back today's discovery slot: it opened nothing and cost nothing from the Claude
   # plan, and FREE_TRIES still bounds the retries (2026-11-09: one repo's failed free attempts used
@@ -2042,13 +2067,13 @@ EOF
   retry() {
     rm -f "$STATE/scanned/$repo"
     if [[ $ENGINE != claude ]]; then
-      local n; n=$(discoveries_today); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$TODAY"
+      local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$disc_day"
     fi
     free_failed "$key" "${1:-}"
   }
   (( rc == 2 )) && { retry all; return; }
   if (( rc == 3 )); then   # agent outage: give back the scan and today's discovery slot
-    rm -f "$STATE/scanned/$repo"; give_back_discovery
+    rm -f "$STATE/scanned/$repo"; local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$disc_day"
     log "  will retry with another agent"; return
   fi
   [[ -z $out ]] && { log "  no structured result"; retry; return; }
@@ -2108,6 +2133,19 @@ fix_more_window() {
 }
 tick() {
   exec 9>"$STATE/lock"; flock -n 9 || { log "previous tick still running"; exit 0; }
+  IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
+  on_tick_abort() {
+    [[ -n ${ACTIVE_TIMED_PID:-} ]] && kill -TERM "$ACTIVE_TIMED_PID" 2>/dev/null || true
+    if [[ -n ${IN_FLIGHT_SCANNED:-} ]]; then
+      rm -f "$IN_FLIGHT_SCANNED"
+      if [[ -n ${IN_FLIGHT_DISC_DAY:-} ]]; then
+        local n; n=$(cat "$STATE/discoveries-$IN_FLIGHT_DISC_DAY" 2>/dev/null || echo 0)
+        (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$IN_FLIGHT_DISC_DAY"
+      fi
+    fi
+    exit 143
+  }
+  trap on_tick_abort TERM INT
   # A bash error inside $(...) (e.g. an unbound variable under set -u) kills only that subshell, so
   # the tick carries on and nothing notices (2026-11-08: a bare `local sid` silently discarded every
   # free-agent result for an hour). Keep this tick's stderr; report the previous tick's script errors.
@@ -2199,15 +2237,16 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
 # disk full, a secret file others can read) is noticed without anyone asking. "GitHub did not
 # answer" alone is retried on the next two ticks first: a laptop that just woke has no network yet.
 daily_doctor() {
-  local mark="$STATE/doctor-day" out fails l tries
-  [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$TODAY" ]] && return 0
-  if out=$(doctor 2>&1); then echo "$TODAY" > "$mark"; rm -f "$mark.retry"; log "daily check: healthy"; return 0; fi
+  local mark="$STATE/doctor-day" d out fails l tries
+  d=$(today)
+  [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$d" ]] && return 0
+  if out=$(doctor 2>&1); then echo "$d" > "$mark"; rm -f "$mark.retry"; log "daily check: healthy"; return 0; fi
   fails=$($GREP -E '^  FAIL  ' <<<"$out" | sed 's/^  FAIL  //')
   if [[ $fails == "GitHub did not answer"* && $fails != *$'\n'* ]]; then
     tries=$(cat "$mark.retry" 2>/dev/null); [[ $tries =~ ^[0-9]+$ ]] || tries=0
     if (( tries < 2 )); then echo $((tries + 1)) > "$mark.retry"; log "daily check: GitHub did not answer; trying again next tick"; return 0; fi
   fi
-  echo "$TODAY" > "$mark"; rm -f "$mark.retry"
+  echo "$d" > "$mark"; rm -f "$mark.retry"
   log "daily check: not healthy"
   while IFS= read -r l; do [[ -n $l ]] && log "  FAIL $l"; done <<<"$fails"
   notify critical "pr-autopilot: daily check found a problem" "${fails:-doctor failed; run ./autopilot.sh doctor}" "doctor ${fails}"
@@ -2694,7 +2733,7 @@ merge_block_reasons() {
 night_report() {
   (( WINDOW_START < WINDOW_END )) || return 0
   local night a b want got sl
-  if (( 10#$(date +%H) >= WINDOW_END )); then night=$TODAY; else night=$(date -d yesterday +%F); fi
+  if (( 10#$(date +%H) >= WINDOW_END )); then night=$(today); else night=$(date -d yesterday +%F); fi
   a=$(printf '%02d' "$WINDOW_START"); b=$(printf '%02d' "$WINDOW_END"); want=$(( (WINDOW_END - WINDOW_START) * 3 ))
   got=$(awk -v a="$a" -v b="$b" '$3 == "===" && $4 == "tick" && substr($2, 1, 2) >= a && substr($2, 1, 2) < b' "$LOGS/$night.log" 2>/dev/null | wc -l)
   (( got * 4 >= want * 3 )) && return 0
@@ -2711,11 +2750,12 @@ night_report() {
 daily_digest() {
   [[ -n ${DIGEST_HOUR:-} && $DRY_RUN != 1 ]] || return 0
   (( 10#$(date +%H) >= DIGEST_HOUR )) || return 0
-  [[ $(cat "$STATE/digest" 2>/dev/null) == "$TODAY" ]] && return 0
-  echo "$TODAY" > "$STATE/digest"
-  local since since_utc lines merged opened waiting body
+  local d since since_utc lines merged opened waiting body
+  d=$(today)
+  [[ $(cat "$STATE/digest" 2>/dev/null) == "$d" ]] && return 0
+  echo "$d" > "$STATE/digest"
   since=$(date -d '24 hours ago' '+%F %T'); since_utc=$(date -u -d '24 hours ago' +%FT%TZ)
-  lines=$(cat "$LOGS/$(date -d yesterday +%F).log" "$LOGS/$TODAY.log" 2>/dev/null | awk -v s="$since" '($1 " " $2) >= s')
+  lines=$(cat "$LOGS/$(date -d yesterday +%F).log" "$LOGS/$d.log" 2>/dev/null | awk -v s="$since" '($1 " " $2) >= s')
   cnt() { $GREP -c -E "$1" <<<"$lines"; }
   local free trials   # idle ticks' model trials aren't work: counted apart (2026-11-09: 23 of 39 free runs)
   free=$(cnt '  starting [a-z]+ \(.*, free\)'); trials=$(cnt '  starting [a-z]+ \(.*, free\): trial')
@@ -2730,7 +2770,7 @@ Agent runs: $(cnt '  starting Claude \(') Claude, $(( free - trials )) free$( ((
   local nr; nr=$(night_report); [[ -n $nr ]] && body+=$'\n'"$nr"
   [[ -f $STATE/usage.json ]] && body+=$'\n'"$(jq -r '"Claude plan: week \(.seven*100|floor)%, 5h \(.five*100|floor)% (read \(.t|strflocaltime("%m-%d %H:%M")))"' "$STATE/usage.json")"
   log "daily digest: ${body//$'\n'/ | }"
-  notify low "pr-autopilot: last 24h" "$body" "digest $TODAY"
+  notify low "pr-autopilot: last 24h" "$body" "digest $d"
 }
 
 # show_status: the status command. Work slots, PRs, and where discovery goes next.
@@ -2996,7 +3036,7 @@ running $(bot_version); journalctl --user -u pr-autopilot" "tick-crashed" ;;
   set-ntfy-topic) set_ntfy_topic ;;
   set-ntfy-token) set_ntfy_token ;;   # save the phone-alert topic in state/ (not in the repo) and send a test alert
   signing-key) signing_key ;;   # make (once) and show the bot's commit signing key
-  cleanup) rm -f "$STATE/housekeep"; housekeeping; echo "done (see $LOG)" ;;   # run the daily disk cleanup now
+  cleanup) rm -f "$STATE/housekeep"; housekeeping; echo "done (see $(log_file))" ;;   # run the daily disk cleanup now
   notify-test) notify normal "pr-autopilot: test notification" "Notifications work. $(date '+%F %T')" "test-$(date +%s)" ;;
   *) echo "usage: $0 [tick|status|doctor|version|models|trial [model|all|new]|usage|selftest|signing-key|cleanup|notify-test|set-claude-token|set-ntfy-topic|set-ntfy-token|agy-login|set-mistral-key]"; exit 2 ;;
 esac

@@ -31,11 +31,21 @@ fi
 while IFS= read -r -d '' f; do
   # every line, not just the first: a .env may hold more than one secret
   while IFS= read -r line || [[ -n $line ]]; do
-    s=${line%$'\r'}; s=${s#*=}
+    s=${line%$'\r'}
+    [[ ${f##*/} == .env ]] && [[ $s =~ ^[[:space:]]*(#|$) ]] && continue
+    s=${s#*=}
+    s=${s#"${s%%[![:space:]]*}"}
+    s=${s%"${s##*[![:space:]]}"}
+    if [[ ( $s == \"*\" && $s == *\" ) || ( $s == \'*\' && $s == *\' ) ]] && (( ${#s} >= 2 )); then
+      s=${s:1:${#s}-2}
+    elif [[ ${f##*/} == .env && $s == *#* ]]; then
+      s=${s%%#*}
+      s=${s%"${s##*[![:space:]]}"}
+    fi
     (( ${#s} >= 12 )) || continue
     if $GREP -rqF -- "$s" "$tmp"; then echo "publish: a secret in ${f#"$HERE"/} appears in a tracked file"; bad=1; break; fi
   done < "$f"
-done < <(find state -maxdepth 3 -type f \( -name 'claude-token' -o -name 'ntfy-topic' -o -name '.env' \) -print0 2>/dev/null)
+done < <(find state -maxdepth 3 -type f \( -name 'claude-token' -o -name 'ntfy-topic' -o -name 'ntfy-auth' -o -name '.env' \) -print0 2>/dev/null)
 if $GREP -rlE '^-----BEGIN [A-Z ]*PRIVATE KEY-----$' "$tmp" | $GREP -q .; then
   echo "publish: a private key is in a tracked file"; bad=1
 fi

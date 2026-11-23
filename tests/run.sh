@@ -31,6 +31,11 @@ CLAUDE_TOKEN_FILE=$STATE/claude-token; MODEL_TRIALS=$STATE/model-trials.json
 mkdir -p "$STATE" "$LOGS" "$AGENT_CFG"
 HOME=$W/home; mkdir -p "$HOME"                       # no real logins in known_secrets
 gh() { [[ "$*" == "auth token" ]] && echo "fakeGhToken0123456789abcdefXYZ"; }
+# ---- production hardening: the current day/log file is resolved at call time, not at startup ----
+eq "today(): follows the wall clock"        "$(date +%F)"              "$(today)"
+eq "today(): honours a test override"       "2000-01-01"                "$(TODAY=2000-01-01; today)"
+eq "log_file(): follows the wall clock"     "$LOGS/$(date +%F).log"     "$(LOG=$LOG_START; log_file)"
+eq "log_file(): honours a LOG override"     "/tmp/x.log"                "$(LOG=/tmp/x.log; log_file)"
 fix='{"required":["summary","declined","needs_human"]}'; trial='{"required":["fixed","summary"]}'
 
 # ---- parsers on real runs -------------------------------------------------------------------
