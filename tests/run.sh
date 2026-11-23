@@ -671,14 +671,19 @@ if declare -F push_wt >/dev/null && declare -F commit_leftovers >/dev/null; then
   eq "leftover .env: not committed, the rest is" "0|.env .env.example |f " "$(envkeep)"
   eq "leftover .env: an env-only leftover makes no commit" "1" "$(commit_only_env() ( root=$(mktemp -d); WT_DIR=$root/wt; log() { :; }; TRAILER=""; export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t; git init -q "$WT_DIR"; echo base > "$WT_DIR/f"; git -C "$WT_DIR" add -A; git -C "$WT_DIR" commit -qm base; echo S > "$WT_DIR/.env"; commit_leftovers "$WT_DIR" x >/dev/null 2>&1; git -C "$WT_DIR" rev-list --count HEAD; rm -rf "$root" ); commit_only_env)"
 else FAILS+=("push_wt/commit_leftovers missing"); fi
-# ---- fix62: a full PR search page (50) is reported, since the PRs past it were not checked this tick
+# ---- fix62: PR search paginates up to 3 pages (150 PRs) and reports if the cap is hit
 if declare -F load_prs >/dev/null; then
-  prs_cap() ( root=$(mktemp -d); STATE=$root/state; mkdir -p "$STATE"   # log() tees its line to stderr
-              gh() { if [[ $1 == api && $2 == graphql ]]; then cat "$root/raw.json"; else return 0; fi; }   # own stub: later tests redefine gh
-              jq -n --argjson n "$1" '{data:{search:{nodes:[range($n)|{}]}}}' > "$root/raw.json"
-              load_prs 2>&1 >/dev/null | grep -c 'returned 50'; rm -rf "$root" )
-  eq "PR search: a full page of 50 is reported"  "1" "$(prs_cap 50)"
-  eq "PR search: 49 is not reported"             "0" "$(prs_cap 49)"
+  prs_cap() ( root=$(mktemp -d); STATE=$root/state; mkdir -p "$STATE"; local more=$1   # log() tees its line to stderr
+              gh() { if [[ $1 == api && $2 == graphql ]]; then
+                       local cur="" args=("$@") i
+                       for ((i=0; i<${#args[@]}; i++)); do [[ ${args[$i]} == cursor=* ]] && cur=${args[$i]#cursor=}; done
+                       jq -n --arg c "$cur" --argjson more "$more" '{data:{search:{pageInfo:{hasNextPage:$more,endCursor:(if $more then ($c+"next") else null end)},nodes:[{number:(if $c=="" then 1 else 2 end)}]}}}'
+                     else return 0; fi; }
+              out=$(load_prs 2>&1 >/dev/null)
+              printf '%s|%s' "$(jq '.data.search.nodes | length' "$STATE/prs.raw.json")" "$(grep -c 'page cap' <<<"$out" || true)"
+              rm -rf "$root" )
+  eq "PR search: stops when hasNextPage is false"  "1|0" "$(prs_cap false)"
+  eq "PR search: paginates and reports 150-PR cap" "3|1" "$(prs_cap true)"
 else FAILS+=("fix62: load_prs missing"); fi
 
 # ---- fix63: agents get no network of their own; their traffic goes through the host egress proxy
