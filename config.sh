@@ -151,6 +151,6 @@ ALLOWED_TOOLS=(
   "Bash(shellcheck:*)" "Bash(bash -n:*)"
 )
 
-# Where your own clones live. The bot makes git worktrees from them (in ~/pr-autopilot/worktrees)
+# Where your own clones live. The bot makes git worktrees from them (in ~/Projects/pr-autopilot/worktrees)
 # and never touches your checkout, branches or uncommitted changes.
 LOCAL_ROOTS=("$HOME/Projects" "$HOME/projects" "$HOME")

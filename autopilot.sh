@@ -9,7 +9,7 @@
 # Usage: autopilot.sh [tick|status|doctor|version|models|trial|usage|selftest|notify-test|set-claude-token|agy-login|set-mistral-key]      DRY_RUN=1 autopilot.sh tick
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# ~/pr-autopilot is a git repo itself: git run in a bot-made repo under state/ or repos/ must never fall
+# ~/Projects/pr-autopilot is a git repo itself: git run in a bot-made repo under state/ or repos/ must never fall
 # back to it (e.g. if a throwaway git init failed). Sandboxed agents never see it (--clearenv, /home tmpfs).
 export GIT_CEILING_DIRECTORIES="$HERE"
 # shellcheck source=config.sh
@@ -110,7 +110,7 @@ flush_ntfy() { # resend queued phone pushes; drop ones older than 12h
 }
 fail() { # <what went wrong> [detail]   log + critical notification
   log "  ERROR: $1${2:+ ($2)}"
-  notify critical "pr-autopilot: $1" "${2:-see ~/pr-autopilot/logs/$(today).log}"
+  notify critical "pr-autopilot: $1" "${2:-see ~/Projects/pr-autopilot/logs/$(today).log}"
 }
 # Secret scan: nothing that looks like a credential is ever posted to GitHub or pushed.
 # Matches common token formats plus the exact values of your own local logins.
@@ -296,7 +296,7 @@ run_timed() {
 run_claude() {
   local dir=$1 schema=$2 tag=$3 out
   out="$LOGS/claude-$(date +%F-%H%M%S)-$tag.jsonl"
-  [[ -s $CLAUDE_TOKEN_FILE ]] || { fail "Claude has no bot token" "run: ~/pr-autopilot/autopilot.sh set-claude-token"; return 1; }
+  [[ -s $CLAUDE_TOKEN_FILE ]] || { fail "Claude has no bot token" "run: ~/Projects/pr-autopilot/autopilot.sh set-claude-token"; return 1; }
   sandbox_for "$dir" claude || { fail "sandbox setup failed for $tag"; return 1; }
   echo $(( $(runs_today) + 1 )) > "$STATE/runs-$(today)"
   log "  starting Claude ($MODEL, run $(runs_today) today, sandboxed): $tag"
@@ -750,7 +750,7 @@ choose_engine() { # <task-key> <round>
       else WHY="Claude takes only one fix per tick"; fi
     elif [[ ! -s $CLAUDE_TOKEN_FILE ]]; then
       WHY="no free agent available, and Claude has no bot token yet (run: ./autopilot.sh set-claude-token)"
-      notify normal "pr-autopilot: Claude fallback is off" "A task needs Claude but it has no bot token. Run: ~/pr-autopilot/autopilot.sh set-claude-token" "no-claude-token"
+      notify normal "pr-autopilot: Claude fallback is off" "A task needs Claude but it has no bot token. Run: ~/Projects/pr-autopilot/autopilot.sh set-claude-token" "no-claude-token"
     elif budget_ok; then ENGINE=claude
     fi
     # Claude can't take a fix (hours, budget, no token): rather than stall, a free model that hasn't
@@ -1033,7 +1033,7 @@ check_signed() {
   [[ $v == "true "* ]] && return 0
   log "  GitHub doesn't verify the bot's signature: ${v#* }"
   notify normal "pr-autopilot: signed commits aren't verified" \
-    "GitHub reports \"${v#* }\" for the bot's signed commit in $1. If the key isn't on your account yet, run: ~/pr-autopilot/autopilot.sh signing-key" "sign-unverified ${v#* }"
+    "GitHub reports \"${v#* }\" for the bot's signed commit in $1. If the key isn't on your account yet, run: ~/Projects/pr-autopilot/autopilot.sh signing-key" "sign-unverified ${v#* }"
 }
 signing_key() {
   if [[ ! -s $SIGN_KEY ]]; then
