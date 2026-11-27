@@ -53,6 +53,8 @@ DEPS_TIMEOUT="10m"          # dependency install (npm ci / uv sync ...) before a
 # their own: every connection goes through a host proxy that only lets these names through (CONNECT
 # on port 443; see egress_up in autopilot.sh). Anchored regexes, one per host. Found with
 # capture-dns.sh: the model APIs, the free agents' providers, and GitHub (for git over https).
+# Every entry MUST start with ^ and end with $: tinyproxy matches unanchored substrings, so a bare
+# api.anthropic.com would also allow api.anthropic.com.attacker.tld. config_errors() enforces this.
 AGENT_HOSTS=(
   '^api\.anthropic\.com$'
   '^opencode\.ai$'
