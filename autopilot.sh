@@ -38,9 +38,12 @@ GREP=/usr/bin/grep   # avoid shell grep aliases
 # Counters and markers are read on the next tick. A direct > leaves a 0-byte file if the laptop
 # suspends or loses power mid-write, which resets a fix budget or drops a pending state.
 write_atomic() { # <path> <value>
-  local p=$1 t="$1.tmp.$$"
-  printf '%s\n' "$2" > "$t" || return 1
-  mv -f "$t" "$p"
+  local p=$1 t
+  # An unpredictable name in the target directory: a predictable path can be pre-created as a
+  # symlink by anyone who can write there, and printf would follow it to an attacker-chosen file.
+  t=$(mktemp "$p.XXXXXX") || return 1
+  printf '%s\n' "$2" > "$t" || { rm -f "$t"; return 1; }
+  mv -f "$t" "$p" || { rm -f "$t"; return 1; }
 }
 # The ntfy topic is a secret (whoever knows it can read the alerts), so it lives in state/ like the
 # tokens, not in the tracked config.sh. Set it with: autopilot.sh set-ntfy-topic

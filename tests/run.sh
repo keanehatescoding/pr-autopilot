@@ -813,7 +813,7 @@ eq "ntfy token: saved owner-only as a header" "600|Authorization: Bearer tk_abcd
 eq "startup: state and transcripts are owner-only by default" "1" "$(grep -c '^umask 077$' "$SRC")"
 atomic_probe() ( root=$(mktemp -d); STATE=$root/s; mkdir -p "$STATE"
          write_atomic "$STATE/n" 5
-         echo "$(cat "$STATE/n")|$(find "$STATE" -name '*.tmp.*' | wc -l)"; rm -rf "$root" )
+         echo "$(cat "$STATE/n")|$(find "$STATE" -name 'n.*' | wc -l)"; rm -rf "$root" )
 eq "write_atomic: complete value, no temp file left behind" "5|0" "$(atomic_probe)"
 # An ordinary test stderr line with a 429 or "quota" in it is not a provider rate limit.
 lim_probe() ( root=$(mktemp -d); f=$root/run.jsonl; echo '{}' > "$f"
