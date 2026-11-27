@@ -784,9 +784,78 @@ secretkeep() ( root=$(mktemp -d); STATE=$root/state; mkdir -p "$STATE"; WT_DIR=$
          echo "$rc|$(git -C "$WT_DIR" log --name-only --format= -1 | sort | tr '\n' ' ')|$(git -C "$WT_DIR" ls-files --others --exclude-standard | sort | tr '\n' ' ')"
          rm -rf "$root" )
 eq "leftover secret-shaped files: only the ordinary file is committed" "0|notes.txt |config/prod.env credentials.json deploy.pem id_rsa .netrc " "$(secretkeep)"
+# fix78: a bwrap mount-point placeholder (0-byte untracked protected path) must never poison a
+# leftover commit, and any placeholder the sandbox creates must be removed when the run ends.
+leftover_placeholders() ( root=$(mktemp -d); STATE=$root/state; mkdir -p "$STATE"; WT_DIR=$root/wt
+         log() { :; }; notify() { :; }; TRAILER=""
+         export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+         git init -q "$WT_DIR"; echo base > "$WT_DIR/f"; git -C "$WT_DIR" add -A; git -C "$WT_DIR" commit -qm base
+         : > "$WT_DIR/package.json"; : > "$WT_DIR/.gitmodules"; echo note > "$WT_DIR/notes.txt"; echo work > "$WT_DIR/app.py"
+         commit_leftovers "$WT_DIR" "agent work" >/dev/null 2>&1; rc=$?
+         echo "$rc|$(git -C "$WT_DIR" log --name-only --format= -1 | sort | tr '\n' ' ')|$(git -C "$WT_DIR" ls-files --others --exclude-standard | sort | tr '\n' ' ')"
+         rm -rf "$root" )
+eq "leftover empty protected placeholders: only real work is committed" "0|app.py notes.txt |.gitmodules package.json " "$(leftover_placeholders)"
+sandbox_placeholder_test() ( root=$(mktemp -d); old=( "${SANDBOX[@]}" ); SANDBOX=()
+         sandbox_bind_hidden "$root/newfile"
+         made=$([[ -e $root/newfile ]] && echo yes || echo no)
+         cleanup_sandbox_placeholders
+         echo "$made|$([[ -e $root/newfile ]] && echo yes || echo no)|${#SANDBOX[@]}"
+         SANDBOX=("${old[@]}")
+         rm -rf "$root" )
+eq "sandbox placeholders: created for a bind and removed after the run" "yes|no|3" "$(sandbox_placeholder_test)"
+# fix79: the host egress daemons outlive a tick, so they must not inherit fd 9 (the tick lock).
+eq "egress daemons: tick lock fd is closed on both spawns" "2" \
+  "$(grep -cE '(tinyproxy -c|socat UNIX-LISTEN:).*9>&-' "$SRC")"
 # fix73: the ntfy access token must look like one, and is saved owner-only
 eq "ntfy token: a non-token is refused" "1" "$(printf 'nope' | ( NTFY_AUTH_FILE=$W/nt1/ntfy-auth; set_ntfy_token >/dev/null 2>&1; echo $? ))"
 eq "ntfy token: saved owner-only as a header" "600|Authorization: Bearer tk_abcdefghijklmnopqrstu" "$(printf 'tk_abcdefghijklmnopqrstu' | ( STATE=$W/nt2; mkdir -p $STATE; NTFY_AUTH_FILE=$STATE/ntfy-auth; set_ntfy_token >/dev/null 2>&1; echo "$(stat -c %a $NTFY_AUTH_FILE)|$(cat $NTFY_AUTH_FILE)" ))"
+# ---- review wave: correctness, sandbox hardening and state safety --------------------------------
+eq "startup: state and transcripts are owner-only by default" "1" "$(grep -c '^umask 077$' "$SRC")"
+atomic_probe() ( root=$(mktemp -d); STATE=$root/s; mkdir -p "$STATE"
+         write_atomic "$STATE/n" 5
+         echo "$(cat "$STATE/n")|$(find "$STATE" -name '*.tmp.*' | wc -l)"; rm -rf "$root" )
+eq "write_atomic: complete value, no temp file left behind" "5|0" "$(atomic_probe)"
+# An ordinary test stderr line with a 429 or "quota" in it is not a provider rate limit.
+lim_probe() ( root=$(mktemp -d); f=$root/run.jsonl; echo '{}' > "$f"
+         printf 'fixture had 429 rows; disk quota 12%% used\n' > "$root/run.err"
+         plain=$(free_limited "$f")
+         printf 'API call failed: HTTP 429 too many requests\n' > "$root/run.err"
+         api=$(free_limited "$f")
+         echo "${plain:-none}|${api:-none}"; rm -rf "$root" )
+eq "rate limits: anchored to API errors, not ordinary stderr" "none|0" "$(lim_probe)"
+anchor_probe() ( orig=( "${AGENT_HOSTS[@]}" ); AGENT_HOSTS=('api.anthropic.com')
+         bad=$(config_errors)
+         AGENT_HOSTS=("${orig[@]}"); good=$(config_errors)
+         [[ $bad == *'not anchored'* && -z $good ]] && echo ok || echo "bad=[$bad] good=[$good]" )
+eq "proxies: config_errors requires ^...$ on every host filter" "ok" "$(anchor_probe)"
+deps_probe() ( root=$(mktemp -d); d=$root/repo; mkdir -p "$d/node_modules" "$STATE/deps"
+         : > "$d/package-lock.json"; : > "$d/uv.lock"
+         sum=$(cd "$d" && cat package-lock.json uv.lock 2>/dev/null | sha256sum | cut -c1-16)
+         write_atomic "$STATE/deps/probe" "$sum"
+         sandbox_for() { SANDBOX=(true); return 0; }
+         run_timed() { echo called >> "$root/calls"; return 0; }
+         prep_deps "$d" probe >/dev/null 2>&1
+         echo "$(wc -l < "$root/calls" 2>/dev/null || echo 0)"; rm -rf "$root" )
+eq "deps: an existing node_modules does not skip a missing .venv" "1" "$(deps_probe)"
+# Structural checks for the sandbox, egress, prompt-fence and state-flow changes.
+eq "egress: waits for the old daemon and allows only localhost" "2" \
+  "$(grep -cE 'kill -0 "\$old"|Allow 127\.0\.0\.1' "$SRC")"
+eq "sandbox: loopback bypasses the proxy and host stores are visible" "4" \
+  "$(grep -cE 'NO_PROXY no_proxy|UV_PYTHON_INSTALL_DIR|PNPM_HOME|-type f -o -type l' "$SRC")"
+eq "host git: only https/file transports" "1" "$(grep -c 'GIT_ALLOW_PROTOCOL=https:file' "$SRC")"
+eq "prompt fence: PR title is sanitized and inside the data block" "2" \
+  "$(grep -cE 'title_safe=|PR title \(untrusted\)' "$SRC")"
+eq "declined threads: never resolved when the reply failed" "1" \
+  "$(grep -c 'addPullRequestReviewThreadReply.*|| continue' "$SRC")"
+eq "discovery branches: second-level names cannot collide in a minute" "2" \
+  "$(grep -c 'date +%Y%m%d-%H%M%S' "$SRC")"
+eq "status: repo names are matched literally" "2" "$(grep -c 'GREP -qxF -- "$r"' "$SRC")"
+eq "merge diagnosis: reuses cached PR data and URL-encodes slash branches" "6" \
+  "$(grep -cE 'cached PR JSON|reviewDecision:\(\.review_decision|base//\\//%2F|cached=\$\{4' "$SRC")"
+eq "housekeeping: dependency caches are bounded too" "2" "$(grep -c 'STATE/deps-cache' "$SRC")"
+eq "agy settings: concurrent grants are serialized" "1" "$(grep -c 'flock -x 7' "$SRC")"
+eq "tick: the stderr tee is flushed before returning" "5" \
+  "$(grep -c 'tick_stderr_restore' "$SRC")"
 echo "$PASS passed, ${#FAILS[@]} failed  ($SRC)"
 for f in "${FAILS[@]}"; do echo "  FAIL: $f"; done
 (( ${#FAILS[@]} == 0 ))

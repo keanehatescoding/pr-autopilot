@@ -8,6 +8,10 @@
 #
 # Usage: autopilot.sh [tick|status|doctor|version|models|trial|usage|selftest|notify-test|set-claude-token|agy-login|set-mistral-key]      DRY_RUN=1 autopilot.sh tick
 set -uo pipefail
+# State and transcripts contain full tool output from private repos: never create them
+# world-readable, even when the invoking shell has a permissive umask (push_wt/park_pr only
+# narrowed their own patches).
+umask 077
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ~/Projects/pr-autopilot is a git repo itself: git run in a bot-made repo under state/ or repos/ must never fall
 # back to it (e.g. if a throwaway git init failed). Sandboxed agents never see it (--clearenv, /home tmpfs).
@@ -31,6 +35,13 @@ log_file() {
   else printf '%s/%s.log' "$LOGS" "$(today)"; fi
 }
 GREP=/usr/bin/grep   # avoid shell grep aliases
+# Counters and markers are read on the next tick. A direct > leaves a 0-byte file if the laptop
+# suspends or loses power mid-write, which resets a fix budget or drops a pending state.
+write_atomic() { # <path> <value>
+  local p=$1 t="$1.tmp.$$"
+  printf '%s\n' "$2" > "$t" || return 1
+  mv -f "$t" "$p"
+}
 # The ntfy topic is a secret (whoever knows it can read the alerts), so it lives in state/ like the
 # tokens, not in the tracked config.sh. Set it with: autopilot.sh set-ntfy-topic
 NTFY_TOPIC_FILE="$STATE/ntfy-topic"
@@ -50,6 +61,9 @@ NTFY_AUTH_FILE="$STATE/ntfy-auth"
 # too. The sandbox clears its environment and sets its own; CI still tests every bot PR.
 export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
        GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
+# A repo config can define ext:: or ssh helpers (credential.helper, insteadOf); host-side git in
+# prep_worktree() must only ever use transports we control.
+export GIT_ALLOW_PROTOCOL=https:file
 
 log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$(log_file)" >&2; }
 # Which install is running: the fixN tag install.sh made, "+N" commits after it, and "-dirty" when
@@ -76,7 +90,7 @@ script_error_key() { printf 'script-error %s' "$(sed -E 's/^line [0-9]+: //' <<<
 # Desktop notification via notify-send (swaync), plus an optional phone push via ntfy.sh (state/ntfy-topic).
 # The same alert is not repeated within NOTIFY_REPEAT_HOURS.
 notify() { # <low|normal|critical> <title> <body> [dedupe-key]
-  secret_in <<<"$2 $3" >/dev/null && set -- "$1" "$2" "(message withheld: it looked like it contained a credential; see the bot log)" "${4:-$2}"
+  secret_in <<<"$2 $3" >/dev/null && set -- "$1" "(withheld: possible credential)" "(message withheld: it looked like it contained a credential; see the bot log)" "${4:-$2}"
   local f; f="$STATE/notified/$(printf '%s' "${4:-$2 $3}" | md5sum | cut -c1-16)"
   [[ -f $f ]] && (( $(date +%s) - $(cat "$f") < NOTIFY_REPEAT_HOURS * 3600 )) && return 0
   [[ $DRY_RUN == 1 ]] && { log "  DRY-RUN would notify: $2 - $3"; return 0; }
@@ -298,7 +312,7 @@ run_claude() {
   out="$LOGS/claude-$(date +%F-%H%M%S)-$tag.jsonl"
   [[ -s $CLAUDE_TOKEN_FILE ]] || { fail "Claude has no bot token" "run: ~/Projects/pr-autopilot/autopilot.sh set-claude-token"; return 1; }
   sandbox_for "$dir" claude || { fail "sandbox setup failed for $tag"; return 1; }
-  echo $(( $(runs_today) + 1 )) > "$STATE/runs-$(today)"
+  write_atomic "$STATE/runs-$(today)" $(( $(runs_today) + 1 ))
   log "  starting Claude ($MODEL, run $(runs_today) today, sandboxed): $tag"
   run_timed "$RUN_TIMEOUT" "${SANDBOX[@]}" -- "${EGRESS_RUN[@]}" claude -p --model "$MODEL" --max-turns "$MAX_TURNS" \
       --output-format stream-json --verbose --json-schema "$schema" \
@@ -315,7 +329,7 @@ run_claude() {
   # only the plan's own wording: a turn-limit error ("limit" alone matched it) must not pause Claude for the day
   if [[ $(jq -r '.is_error // false' <<<"$res") == true && $(jq -r '.subtype // ""' <<<"$res") != error_max_turns ]] &&
      jq -r '.result // ""' <<<"$res" | $GREP -qiE 'usage limit|plan limit|limit reached'; then
-    fail "Claude plan limit hit" "Claude runs paused for today; free agents keep going"; echo "$MAX_RUNS_PER_DAY" > "$STATE/runs-$(today)"
+    fail "Claude plan limit hit" "Claude runs paused for today; free agents keep going"; write_atomic "$STATE/runs-$(today)" "$MAX_RUNS_PER_DAY"
   fi
   jq -c '.structured_output // (.result | try fromjson catch empty) // empty' <<<"$res" 2>/dev/null
 }
@@ -431,22 +445,28 @@ for _ in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/8899) 2>/dev/null && break; 
 exec "$@"'
 EGRESS_RUN=()   # the command prefix that starts the bridge inside the sandbox; empty without the proxy
 egress_start() { # <dir> <host port> <allowed host regexes...>: starts or restarts a host proxy and its socket in <dir>; returns 1 when they don't come up
-  local dir=$1 port=$2 i pid; shift 2
+  local dir=$1 port=$2 i pid old; shift 2
   mkdir -p "$dir"; printf '%s\n' "$@" > "$dir/allow.new"
   if ! cmp -s "$dir/allow.new" "$dir/allow.txt" 2>/dev/null || ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     mv "$dir/allow.new" "$dir/allow.txt"
-    [[ -s $dir/tinyproxy.pid ]] && kill "$(cat "$dir/tinyproxy.pid")" 2>/dev/null
-    printf '%s\n' "Port $port" "Listen 127.0.0.1" "Timeout 60" "MaxClients 20" "PidFile \"$dir/tinyproxy.pid\"" \
+    old=$(cat "$dir/tinyproxy.pid" 2>/dev/null)
+    if [[ -n $old ]]; then
+      kill "$old" 2>/dev/null || true
+      # Wait for the old listener to release the port. Launching immediately raced its socket
+      # close: the new daemon failed to bind while the port probe still saw the dying one.
+      for i in $(seq 40); do kill -0 "$old" 2>/dev/null || break; sleep 0.05; done
+    fi
+    printf '%s\n' "Port $port" "Listen 127.0.0.1" "Allow 127.0.0.1" "Timeout 60" "MaxClients 20" "PidFile \"$dir/tinyproxy.pid\"" \
       "LogFile \"$dir/tinyproxy.log\"" "FilterDefaultDeny Yes" "Filter \"$dir/allow.txt\"" "FilterExtended Yes" \
       "ConnectPort 443" > "$dir/tinyproxy.conf"
-    tinyproxy -c "$dir/tinyproxy.conf" </dev/null >>"$LOG" 2>&1
+    tinyproxy -c "$dir/tinyproxy.conf" </dev/null 9>&- >>"$LOG" 2>&1
     for i in $(seq 40); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.05; done
   else rm -f "$dir/allow.new"; fi
   pid=$(cat "$dir/socat.pid" 2>/dev/null)
   if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null || [[ ! -S $dir/proxy.sock ]]; then
     [[ -n $pid ]] && kill "$pid" 2>/dev/null
     rm -f "$dir/proxy.sock"
-    socat UNIX-LISTEN:"$dir/proxy.sock",fork,unlink-early,mode=600 TCP:127.0.0.1:$port </dev/null >>"$LOG" 2>&1 &
+    socat UNIX-LISTEN:"$dir/proxy.sock",fork,unlink-early,mode=600 TCP:127.0.0.1:$port </dev/null 9>&- >>"$LOG" 2>&1 &
     echo $! > "$dir/socat.pid"
     for i in $(seq 40); do [[ -S $dir/proxy.sock ]] && break; sleep 0.05; done
   fi
@@ -456,9 +476,28 @@ egress_start() { # <dir> <host port> <allowed host regexes...>: starts or restar
 }
 egress_up() { egress_start "$STATE/egress" "$EGRESS_PORT" "${AGENT_HOSTS[@]}"; }                 # agents: model APIs and GitHub
 egress_deps_up() { egress_start "$STATE/egress-deps" "$EGRESS_DEPS_PORT" "${DEPS_HOSTS[@]}"; }   # dependency installs: package registries only
+# bwrap creates its mount point on the host if the destination path doesn't exist. An empty
+# package.json/.gitmodules left behind that way is swept up by commit_leftovers and then makes
+# protected_touched discard the agent's whole fix. Record any placeholder we create and remove it
+# when the run ends; only bind over paths that already exist.
+SANDBOX_PLACEHOLDERS=()
+sandbox_bind_hidden() { # <path>: mask one untracked file with /dev/null
+  local f=$1
+  if [[ ! -e $f ]]; then
+    : > "$f" || return 1
+    SANDBOX_PLACEHOLDERS+=("$f")
+  fi
+  SANDBOX+=(--ro-bind /dev/null "$f")
+}
+cleanup_sandbox_placeholders() {
+  local f
+  for f in "${SANDBOX_PLACEHOLDERS[@]}"; do rm -f -- "$f"; done
+  SANDBOX_PLACEHOLDERS=()
+}
+
 sandbox_for() { # <dir> [claude] [mode]: mode "" = an agent (the agent proxy); deps = a dependency install (the registry proxy,
   # its own home and cache, no agent config or login); net = the step's own network, for interactive logins
-  local d=$1 common gd p v sock mode=${3:-agent} home cache cfg data
+  local d=$1 common gd p v sock mode=${3:-agent} home cache cfg data real_home=$HOME
   if [[ $mode == deps ]]; then home="$STATE/deps-home"; cache="$STATE/deps-cache"; cfg="$home/.config"; data="$home/.local/share"
   else home="$STATE/agent-home"; cache="$STATE/agent-cache"; cfg=$AGENT_CFG; data=$AGENT_DATA; fi
   common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir) || return 1
@@ -474,6 +513,10 @@ sandbox_for() { # <dir> [claude] [mode]: mode "" = an agent (the agent proxy); d
     else egress_up || return 1; sock="$STATE/egress/proxy.sock"; fi
     SANDBOX+=(--bind "$sock" "$sock" --setenv EGRESS_SOCK "$sock")
     for v in HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy; do SANDBOX+=(--setenv $v "http://127.0.0.1:$EGRESS_PORT"); done
+    # The bridge is a plain HTTP CONNECT proxy (not SOCKS); ALL_PROXY stays http:// because every
+    # proxy we start speaks HTTP. Loopback must bypass it: an agent's own test server on 127.0.0.1
+    # was otherwise sent through tinyproxy, which only allows CONNECT to 443, and the tests failed.
+    for v in NO_PROXY no_proxy; do SANDBOX+=(--setenv "$v" "localhost,127.0.0.1,::1"); done
     EGRESS_RUN=(/usr/bin/bash -c "$EGRESS_SHIM" egress)
   fi
   [[ -d /opt ]] && SANDBOX+=(--ro-bind /opt /opt)
@@ -481,6 +524,10 @@ sandbox_for() { # <dir> [claude] [mode]: mode "" = an agent (the agent proxy); d
   for p in .local/bin .local/share/uv/python .local/share/uv/tools .local/share/pnpm .rustup .cargo/bin; do
     [[ -e $HOME/$p ]] && SANDBOX+=(--ro-bind "$HOME/$p" "$HOME/$p")
   done
+  # uv and pnpm look under XDG_DATA_HOME (which we override), not under the original $HOME where
+  # their host stores are bind-mounted. Point them at the visible copies or they download again.
+  SANDBOX+=(--setenv UV_PYTHON_INSTALL_DIR "$real_home/.local/share/uv/python"
+            --setenv PNPM_HOME "$real_home/.local/share/pnpm")
   SANDBOX+=(--ro-bind "$common" "$common" --bind "$common/objects" "$common/objects")
   [[ $gd != "$common" ]] && SANDBOX+=(--bind "$gd" "$gd") || SANDBOX+=(--bind "$common" "$common")
   SANDBOX+=(--bind "$d" "$d" --bind "$home" "$home" --bind "$cache" "$cache")
@@ -519,9 +566,13 @@ sandbox_for() { # <dir> [claude] [mode]: mode "" = an agent (the agent proxy); d
     # make an agent's commit delete it. Claude's Read is not restricted this way (its tests need .env).
     local f
     while IFS= read -r -d '' f; do
+      # bwrap makes a 0-byte mount point on the host when the destination is missing; only ever
+      # mask paths that really exist, and remember any placeholder we do have to make.
+      [[ -e $f ]] || continue
       git -C "$d" ls-files --error-unmatch -z -- "$f" >/dev/null 2>&1 && continue
-      SANDBOX+=(--ro-bind /dev/null "$f")
-    done < <(find "$d" \( -name .git -o -name node_modules -o -name .venv \) -prune -o -type f \
+      sandbox_bind_hidden "$f" || return 1
+    done < <(find "$d" \( -name .git -o -name node_modules -o -name .venv \) -prune -o \
+               \( -type f -o -type l \) \
                \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print0)
   fi
 }
@@ -575,7 +626,9 @@ free_limited() {
              or ((.type // "") | test("limit|rate";"i")) or ((.data.message? // "") | test("rate.limit|usage limit|quota";"i")))
            | ((.retryAfterMs // 0) / 1000 | floor)] | if length > 0 then max else empty end' "$1" 2>/dev/null)
   # agy / vibe report quota errors as text (stderr, kept next to the events) or a non-success status
-  if [[ -z $s ]] && { $GREP -qiE '\b429\b|RESOURCE_EXHAUSTED|CAPACITY_EXHAUSTED|rate.?limit|quota|usage limit|too many requests' "${1%.jsonl}.err" 2>/dev/null ||
+  # Anchored to HTTP/API error shapes: a plain "429" or "quota" in a test's stderr is not a
+  # provider rate limit (rc=3 skips freefail, so a false match retried the same repo forever).
+  if [[ -z $s ]] && { $GREP -qiE '(HTTP[/ ]?429|(status|statusCode|code)[[:space:]"=:]+429|"status"[[:space:]]*:[[:space:]]*429|RESOURCE_EXHAUSTED|CAPACITY_EXHAUSTED|too many requests|rate.?limit exceeded|quota exceeded|usage limit reached)' "${1%.jsonl}.err" 2>/dev/null ||
        jq -e 'select(.event=="result" and .result.status != "SUCCESS") | .result | tostring | test("EXHAUST|QUOTA|LIMIT|429";"i")' "$1" >/dev/null 2>&1; }; then
     s=0
   fi
@@ -627,9 +680,17 @@ free_cmd() {
 # broad write_file(*) would also let it write its own home (settings, login keyring). 2026-11-09 probes.
 # Fails rather than leave the previous run's grant (another worktree) in place.
 agy_grant() {
-  local d f="$AGENT_CFG/agy-settings.json"; d=$(realpath -e "$1") && [[ -d $d ]] || return 1
+  local d f="$AGENT_CFG/agy-settings.json" lf="$STATE/agy-settings.lock" rc
+  d=$(realpath -e "$1") && [[ -d $d ]] || return 1
+  # An interactive trial/selftest and a running tick can both grant a directory. Use a dedicated
+  # lock: $STATE/lock is already held by the tick on fd 9, so locking it here would deadlock.
+  exec 7>"$lf" || return 1
+  flock -x 7 || { exec 7>&-; return 1; }
   jq -ce --arg d "$d" '.permissions.allow = ([.permissions.allow[] | select(startswith("write_file(") | not)] + ["write_file(\($d))"])' \
-    "$f" > "$f.new" 2>/dev/null && mv "$f.new" "$f" || { rm -f "$f.new"; return 1; }
+    "$f" > "$f.new" 2>/dev/null && mv "$f.new" "$f"; rc=$?
+  (( rc )) && rm -f "$f.new"
+  flock -u 7; exec 7>&-
+  return $rc
 }
 # free_step <spec> <dir> <out> <timeout> [session] [schema]  (prompt on stdin): one agent invocation,
 # events appended to out
@@ -800,7 +861,7 @@ free_failed() {
   [[ $ENGINE == claude ]] && return
   local f; f=$(cat "$STATE/freefail/$1" 2>/dev/null || echo 0)
   if [[ ${2:-} == all ]]; then f=$FREE_TRIES; else f=$((f + 1)); fi
-  echo "$f" > "$STATE/freefail/$1"
+  write_atomic "$STATE/freefail/$1" "$f"
   log "  free attempt failed ($f/$FREE_TRIES)$( (( f >= FREE_TRIES )) && echo " - Claude takes over")"
 }
 # Agents sometimes can't run git commit; commit what they left (respects .gitignore).  <dir> <subject>
@@ -812,7 +873,15 @@ LEFTOVER_SECRET_GLOBS=('**/.env' '**/.env.*' '**/*.env' '**/*.pem' '**/*.key' '*
 commit_leftovers() {
   [[ -n $(git "${GIT_X[@]}" -C "$1" status --porcelain) ]] || return 0
   # Tracked files still go in: the owner committed them, so changes to them are real work.
-  local ex=() g; for g in "${LEFTOVER_SECRET_GLOBS[@]}"; do ex+=(":(exclude,glob)$g"); done
+  local ex=() g f rel; for g in "${LEFTOVER_SECRET_GLOBS[@]}"; do ex+=(":(exclude,glob)$g"); done
+  # A 0-byte untracked protected path is a sandbox mount point, not work. Never let it into a
+  # leftover commit: protected_touched would reject the whole commit and discard the real fix.
+  while IFS= read -r -d '' f; do
+    [[ $(stat -c %s -- "$f") == 0 ]] || continue
+    rel=${f#"$1"/}
+    printf '%s\n' "$rel" | $GREP -qE "$PROTECTED_PATHS" || continue
+    ex+=(":(exclude,glob)$rel")
+  done < <(find "$1" \( -name .git -o -name node_modules -o -name .venv \) -prune -o -type f -size 0 -print0)
   git "${GIT_X[@]}" -C "$1" add -A -- . "${ex[@]}" || return 1
   git -C "$1" diff --cached --quiet && return 0   # only excluded files changed: nothing to commit
   git -C "$1" commit -q -m "$2" -m "$TRAILER" && log "  committed the agent's uncommitted changes"
@@ -962,7 +1031,7 @@ housekeeping() {
   local mark="$STATE/housekeep" d w repo gd common busy c mb freed=0 unpushed
   d=$(today)
   [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$d" ]] && return 0
-  echo "$d" > "$mark"
+  write_atomic "$mark" "$d"
   busy=$(jq -r '.data.search.nodes[].repository.name' "$STATE/prs.raw.json" 2>/dev/null)
   for w in "$WORKTREES"/*; do
     repo=${w##*/}
@@ -980,7 +1049,9 @@ housekeeping() {
       log "  removed the idle $repo worktree (unused ${WT_KEEP_DAYS:-7}+ days, ${mb:-?}M)"
     fi
   done
-  for c in "$STATE/agent-cache/uv" "$STATE/agent-home/.npm" "$STATE/agent-cache/pip"; do
+  # deps installs use their own home/cache (sandbox_for ... deps) and grew without bound.
+  for c in "$STATE/agent-cache/uv" "$STATE/agent-home/.npm" "$STATE/agent-cache/pip" \
+           "$STATE/deps-cache" "$STATE/deps-home/.npm"; do
     [[ -d $c ]] || continue
     mb=$(excl_mb "$c")
     (( ${mb:-0} > ${CACHE_MAX_MB:-300} )) || continue
@@ -1053,21 +1124,26 @@ signing_key() {
 # secrets visible) so agents can run tests. Skipped while the lockfiles are unchanged. Sets DEPS_NOTE.
 DEPS_NOTE=""
 prep_deps() {
-  local d=$1 repo=$2 f="$STATE/deps/$2" steps=() reqs="" r sum dl
+  local d=$1 repo=$2 f="$STATE/deps/$2" steps=() reqs="" r sum dl js=0 py=0 need=0
   DEPS_NOTE=""
-  if [[ -f $d/package-lock.json ]]; then steps+=("npm ci --no-audit --no-fund --loglevel=error")
-  elif [[ -f $d/pnpm-lock.yaml ]] && command -v pnpm >/dev/null; then steps+=("pnpm install --frozen-lockfile")
-  elif [[ -f $d/yarn.lock ]] && command -v yarn >/dev/null; then steps+=("yarn install --frozen-lockfile")
-  elif [[ -f $d/bun.lock || -f $d/bun.lockb ]] && command -v bun >/dev/null; then steps+=("bun install --frozen-lockfile")
+  if [[ -f $d/package-lock.json ]]; then steps+=("npm ci --no-audit --no-fund --loglevel=error"); js=1
+  elif [[ -f $d/pnpm-lock.yaml ]] && command -v pnpm >/dev/null; then steps+=("pnpm install --frozen-lockfile"); js=1
+  elif [[ -f $d/yarn.lock ]] && command -v yarn >/dev/null; then steps+=("yarn install --frozen-lockfile"); js=1
+  elif [[ -f $d/bun.lock || -f $d/bun.lockb ]] && command -v bun >/dev/null; then steps+=("bun install --frozen-lockfile"); js=1
   fi
-  if [[ -f $d/uv.lock ]]; then steps+=("uv sync --frozen")
+  if [[ -f $d/uv.lock ]]; then steps+=("uv sync --frozen"); py=1
   else
     for r in "$d"/requirements*.txt; do [[ -f $r ]] && reqs+=" -r $(printf '%q' "${r##*/}")"; done
-    [[ -n $reqs ]] && steps+=("uv venv -q --allow-existing .venv && uv pip install -q$reqs")
+    [[ -n $reqs ]] && { steps+=("uv venv -q --allow-existing .venv && uv pip install -q$reqs"); py=1; }
   fi
   (( ${#steps[@]} )) || return 0
   sum=$(cd "$d" && cat package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb uv.lock requirements*.txt 2>/dev/null | sha256sum | cut -c1-16)
-  if [[ $(cat "$f" 2>/dev/null) != "$sum" ]] || [[ ! -d $d/node_modules && ! -d $d/.venv ]]; then
+  # Check each active ecosystem separately: with both package-lock.json and uv.lock, an existing
+  # node_modules used to skip uv sync for a missing .venv (and vice versa).
+  [[ $(cat "$f" 2>/dev/null) != "$sum" ]] && need=1
+  (( js )) && [[ ! -d $d/node_modules ]] && need=1
+  (( py )) && [[ ! -d $d/.venv ]] && need=1
+  if (( need )); then
     dl="$LOGS/deps-$(date +%F-%H%M%S)-$repo.log"
     log "  installing dependencies (sandboxed): ${steps[*]}"
     if ! sandbox_for "$d" "" deps; then
@@ -1076,7 +1152,7 @@ prep_deps() {
       return 0
     fi
     if run_timed "$DEPS_TIMEOUT" "${SANDBOX[@]}" -- bash -c "set -e; $(printf '%s\n' "${steps[@]}")" </dev/null >"$dl" 2>&1; then
-      echo "$sum" > "$f"
+      write_atomic "$f" "$sum"
     else
       rm -f "$f"; log "  dependency install failed (see $dl)"
       DEPS_NOTE="Installing the dependencies failed (${steps[*]}), so tests may not run; don't spend many steps on that."
@@ -1280,7 +1356,7 @@ query($q:String!,$cursor:String){search(type:ISSUE,query:$q,first:50,after:$curs
 }
 
 cr_next_allowed() { cat "$STATE/cr_next" 2>/dev/null || echo 0; }
-bump_cr_next() { (( $1 > $(cr_next_allowed) )) && echo "$1" > "$STATE/cr_next"; }
+bump_cr_next() { (( $1 > $(cr_next_allowed) )) && write_atomic "$STATE/cr_next" "$1"; }
 
 request_cr_review() { # <repo> <n> <head>
   log "  asking CodeRabbit to review $1#$2"
@@ -1292,7 +1368,7 @@ request_cr_review() { # <repo> <n> <head>
   bump_cr_next $(( NOW + CR_COOLDOWN_MIN * 60 ))
 }
 
-merge_pr() { # <repo> <n> <head> [merge signature: review decision + reported checks] [base]
+merge_pr() { # <repo> <n> <head> [merge signature] [base] [cached PR JSON]
   if [[ $AUTO_MERGE != 1 ]]; then   # it waits for you: free its slot, as for the other ready PRs
     PARKED_COUNT=$((PARKED_COUNT + 1))
     # label each commit once: every tick re-labelled and re-logged the same PR. A new commit is labelled again.
@@ -1312,7 +1388,7 @@ merge_pr() { # <repo> <n> <head> [merge signature: review decision + reported ch
     [[ $DRY_RUN == 1 ]] || rm -f "$STATE/rounds/$1-$2" "$STATE/crreq/$1-$2" "$STATE/freefail/fix-$1-$2" "$STATE/updated/$1-$2" "$STATE/reopened/$1-$2" "$STATE/bodyfix/$1-$2" "$STATE/mergefail/$1-$2" "$STATE/mergefail/$1-$2.why" "$STATE/cifix/$1-$2"
   else
     log "  gh: $(head -1 <<<"$err" | sed 's/^X //')"
-    local why; why=$([[ -n ${5:-} ]] && merge_block_reasons "$1" "$2" "$5")
+    local why; why=$([[ -n ${5:-} ]] && merge_block_reasons "$1" "$2" "$5" "${6:-}")
     [[ -n $why ]] && log "  why: $why"
     # The alert carries GitHub's own reason (the old text was a guess), and repeats are deduplicated per PR:
     # hyprland-mcp#24 alerted three times in two days for the same refusal.
@@ -1323,11 +1399,11 @@ merge_pr() { # <repo> <n> <head> [merge signature: review decision + reported ch
     PARKED_COUNT=$((PARKED_COUNT + 1))
     # Do not retry every tick: wait until the head, the review decision or the set of reported
     # checks changes (e.g. CodeQL results finally arrive), or 6h pass (see review_prs)
-    [[ $DRY_RUN == 1 ]] || { echo "$3 ${4:-}" > "$STATE/mergefail/$1-$2"; printf '%s\n' "$why" > "$STATE/mergefail/$1-$2.why"; }
+    [[ $DRY_RUN == 1 ]] || { write_atomic "$STATE/mergefail/$1-$2" "$3 ${4:-}"; write_atomic "$STATE/mergefail/$1-$2.why" "$why"; }
   fi
 }
 
-# land_pr <repo> <n> <head> <base> <head-time>: merge a clean PR, but if its branch is behind the
+# land_pr <repo> <n> <head> <base> <head-time> <signature> [cached PR JSON]: merge a clean PR, but if its branch is behind the
 # base, first have GitHub merge the base in (free) so CI runs on what will actually land.
 # The review verdicts carry over to that update commit (see load_prs); CI must pass again.
 land_pr() {
@@ -1339,12 +1415,12 @@ land_pr() {
   update_failed() { # <what> <detail>
     fail "$1" "$2 - labelled ready - https://github.com/$OWNER/$repo_/pull/$n_"; add_label "$repo_" "$n_" "$LABEL-ready"
     PARKED_COUNT=$((PARKED_COUNT + 1))
-    [[ $DRY_RUN == 1 ]] || { echo "$head_ $sig_" > "$STATE/mergefail/$repo_-$n_"; printf '%s\n' "$1" > "$STATE/mergefail/$repo_-$n_.why"; }
+    [[ $DRY_RUN == 1 ]] || { write_atomic "$STATE/mergefail/$repo_-$n_" "$head_ $sig_"; write_atomic "$STATE/mergefail/$repo_-$n_.why" "$1"; }
   }
   local repo_=$1 n_=$2 head_=$3 sig_=${6:-}
   behind=$(gh api "repos/$OWNER/$1/compare/$4...$3" --jq .behind_by 2>>"$LOG") ||
     { log "  couldn't check whether $1#$2 is behind $4; trying next tick"; return; }
-  (( behind == 0 )) && { merge_pr "$1" "$2" "$3" "${6:-}" "$4"; return; }
+  (( behind == 0 )) && { merge_pr "$1" "$2" "$3" "${6:-}" "$4" "${7:-}"; return; }
   asked=$(awk -v h="$3" '$1 == h {print $3}' "$f" 2>/dev/null | tail -1)
   if [[ -n $asked ]]; then
     if (( NOW - asked < 1800 )); then log "  branch update asked at $(date -d "@$asked" +%H:%M); waiting for GitHub"
@@ -1383,10 +1459,10 @@ base_failing() {
 # (2026-11-08: hyprland-mcp#24 never got check-release, a cron-only workflow).
 declare -A REQ_CHECKS
 missing_required() { # <repo> <base> <pr-json>
-  local k="$1/$2"
+  local k="$1/$2" b=${2//\//%2F}   # GitHub needs a slash in a branch name URL-encoded
   if [[ -z ${REQ_CHECKS[$k]+x} ]]; then
-    REQ_CHECKS[$k]=$( { gh api "repos/$OWNER/$1/rules/branches/$2" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]'
-                        gh api "repos/$OWNER/$1/branches/$2/protection/required_status_checks" --jq '[.contexts[]]'
+    REQ_CHECKS[$k]=$( { gh api "repos/$OWNER/$1/rules/branches/$b" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]'
+                        gh api "repos/$OWNER/$1/branches/$b/protection/required_status_checks" --jq '[.contexts[]]'
                       } 2>/dev/null | jq -sc '[.[] | arrays] | add // [] | unique')
     [[ -n ${REQ_CHECKS[$k]} ]] || REQ_CHECKS[$k]='[]'
   fi
@@ -1445,7 +1521,7 @@ review_prs() {
   local prs n
   if ! prs=$(load_prs); then
     sleep 30; prs=$(load_prs) || {
-      n=$(( $(cat "$STATE/loadfail" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/loadfail"
+      n=$(( $(cat "$STATE/loadfail" 2>/dev/null || echo 0) + 1 )); write_atomic "$STATE/loadfail" "$n"
       if (( n >= 3 )); then fail "can't reach GitHub ($n ticks in a row)" "offline, GitHub down, or gh logged out? Check: gh auth status"
       else log "  could not load PRs from GitHub (attempt $n; alerting after 3)"; fi
       return 1; }
@@ -1575,7 +1651,7 @@ review_prs() {
         PARKED_COUNT=$((PARKED_COUNT + 1))
         log "  clean, but GitHub refused to merge or update ${head:0:7} earlier - labelled ready; waiting for you (retries on a new commit, review or check, or after 6h)"
         [[ -s $STATE/mergefail/$repo-$n.why ]] && log "  why: $(cat "$STATE/mergefail/$repo-$n.why")"
-      elif [[ $mergeable == MERGEABLE ]] && (( age >= 10 )); then land_pr "$repo" "$n" "$head" "$(jq -r .base <<<"$pr")" "$(jq .head_time <<<"$pr")" "$msig"
+      elif [[ $mergeable == MERGEABLE ]] && (( age >= 10 )); then land_pr "$repo" "$n" "$head" "$(jq -r .base <<<"$pr")" "$(jq .head_time <<<"$pr")" "$msig" "$pr"
       else log "  clean; waiting for GitHub mergeable state ($mergeable)"; fi
       continue
     fi
@@ -1585,7 +1661,7 @@ review_prs() {
     if [[ $problems == true && $ci == failed && $waiting == true && $(cat "$STATE/cifix/$repo-$n" 2>/dev/null) != "$head" ]] &&
        free_fix_ok "fix-$repo-$n" $((rounds + 1)); then
       log "  CI failed - fixing it now with a free model, before the reviews are in"
-      [[ $DRY_RUN == 1 ]] || echo "$head" > "$STATE/cifix/$repo-$n"
+      [[ $DRY_RUN == 1 ]] || write_atomic "$STATE/cifix/$repo-$n" "$head"
       queue_fix "$pr" "$repo" "$n" "$rounds"; continue
     fi
     # Fix once every reviewer has spoken (batches feedback into one Claude run), or after 90 min regardless
@@ -1658,9 +1734,12 @@ FIX_SCHEMA='{"type":"object","properties":{
  "required":["summary","declined","needs_human"]}'
 
 fix_pr() {
-  local pr=$1 repo n branch base title d conflict=""
+  local pr=$1 repo n branch base title title_safe d conflict=""
   repo=$(jq -r .repo <<<"$pr"); n=$(jq -r .n <<<"$pr"); branch=$(jq -r .branch <<<"$pr")
   base=$(jq -r .base <<<"$pr"); title=$(jq -r .title <<<"$pr")
+  # A PR title is attacker-controlled data. Keep it out of the instruction header/fence and strip
+  # newlines, angle brackets and control characters so it cannot forge a prompt heading or a tag.
+  title_safe=$(printf '%s' "$title" | tr '\r\n\t' '   ' | tr -d '<>\000' | cut -c1-200)
   local key="fix-$repo-$n"
   log "fixing $repo#$n with ${ENGINE%%:*}"
   [[ $DRY_RUN == 1 ]] && { log "  DRY-RUN: would run $ENGINE to fix $repo#$n"; return; }
@@ -1712,11 +1791,11 @@ fix_pr() {
   # Counted below, once an agent has actually run: a handoff (rc 2/3) doesn't use up a round.
   local round scope=""; round=$(( $(cat "$STATE/rounds/$repo-$n" 2>/dev/null || echo 0) + 1 ))
   (( round >= 3 )) && scope="
-- This is fix round $round of at most $MAX_FIX_ROUNDS for this PR, and every round so far has drawn new findings. Keep this round small and on the PR's purpose (\"$title\"). If a finding is about code that earlier fix rounds added beyond that purpose, prefer simplifying or removing that code over extending it. Don't add new machinery (storage, migrations, new modes or subsystems) to cover an edge case; a finding that would need it can be declined as out of scope for this PR, saying what a follow-up would need."
+- This is fix round $round of at most $MAX_FIX_ROUNDS for this PR, and every round so far has drawn new findings. Keep this round small and on the PR's purpose (\"$title_safe\"). If a finding is about code that earlier fix rounds added beyond that purpose, prefer simplifying or removing that code over extending it. Don't add new machinery (storage, migrations, new modes or subsystems) to cover an edge case; a finding that would need it can be declined as out of scope for this PR, saying what a follow-up would need."
   local data_tag="github_data_$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')"
   local out rc
   out=$(run_agent "$d" "$FIX_SCHEMA" "$key" <<EOF
-You are an unattended maintenance bot. You are in a worktree of github.com/$OWNER/$repo with HEAD detached at branch $branch (the harness pushes your commits to it), which is PR #$n ("$title") into $base. Your job: address the feedback below, then commit. Do NOT push; the harness pushes and talks to GitHub.
+You are an unattended maintenance bot. You are in a worktree of github.com/$OWNER/$repo with HEAD detached at branch $branch (the harness pushes your commits to it), which is PR #$n into $base. Your job: address the feedback below, then commit. Do NOT push; the harness pushes and talks to GitHub.
 
 Rules:
 - You have a limited step budget, so go straight to the relevant files.
@@ -1731,6 +1810,7 @@ Rules:
 
 # Feedback
 <$data_tag>
+PR title (untrusted): $title_safe
 $ctx
 </$data_tag>
 EOF
@@ -1738,7 +1818,7 @@ EOF
   rc=$?
   (( rc == 2 )) && { free_failed "$key" all; return; }
   (( rc == 3 )) && { log "  will retry with another agent"; return; }
-  echo "$round" > "$STATE/rounds/$repo-$n"   # an attempt that ran counts, even if it gave no usable result
+  write_atomic "$STATE/rounds/$repo-$n" "$round"   # an attempt that ran counts, even if it gave no usable result
   if [[ -z $out ]]; then
     log "  no structured result (turn limit or error); will retry next round"; free_failed "$key"; return
   fi
@@ -1801,7 +1881,7 @@ EOF
       safe_text "thread reply" "$repo#$n" "$reason" || continue
       gh api graphql -f id="$tid" -f body="Not applying this: $reason
 
-_(pr-autopilot)_" -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}' >/dev/null
+_(pr-autopilot)_" -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}' >/dev/null || continue
     elif (( ahead == 0 )); then continue
     else
       # "fixed" given: trust it. Missing (weaker models skip optional keys): fall back to the file.
@@ -1853,7 +1933,7 @@ pick_repo() { # round-robin over repos.txt (refresh_repos) without an open bot P
 
 discoveries_today() { cat "$STATE/discoveries-$(today)" 2>/dev/null || echo 0; }
 # give_back_discovery: return this tick's discovery slot, never below zero
-give_back_discovery() { local n; n=$(discoveries_today); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$(today)"; return 0; }
+give_back_discovery() { local n; n=$(discoveries_today); (( n > 0 )) && write_atomic "$STATE/discoveries-$(today)" $(( n - 1 )); return 0; }
 # open_pr <repo> <base> <branch> <result-json> <issue>: open the PR for a branch that is already pushed.
 # "Closes #issue" is added only for a real issue number (0 or empty: none).
 open_pr() {
@@ -1976,7 +2056,7 @@ replay_unpushed() {
     bad=$(protected_touched "$WT_DIR" "$REMOTE/$base")
     [[ -n $bad ]] && { shelve "it touches protected paths ($(tr '\n' ' ' <<<"$bad"))"; continue; }
     ENGINE=$(jq -r '.engine // "unknown:unknown"' <<<"$out"); set_attribution
-    branch="$LABEL/$(date +%Y%m%d-%H%M)"
+    branch="$LABEL/$(date +%Y%m%d-%H%M%S)"   # two manual ticks in one minute must not share a branch
     publish_pr "$repo" "$base" "$branch" "$out"; rc=$?
     if (( rc == 4 )); then   # still can't push: keep the original pair, drop push_wt's new copy
       [[ -n $UNPUSHED ]] && rm -f "$UNPUSHED"; touch "${j%.json}.tried"; return 0
@@ -2005,8 +2085,8 @@ discover() { # <repo>
   log "looking for work in $repo with ${ENGINE%%:*}"
   [[ $DRY_RUN == 1 ]] && { log "  DRY-RUN: would run $ENGINE discovery in $repo"; return; }
   local disc_day; disc_day=$(today)
-  echo "$NOW" > "$STATE/scanned/$repo"
-  echo $(( $(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0) + 1 )) > "$STATE/discoveries-$disc_day"
+  write_atomic "$STATE/scanned/$repo" "$NOW"
+  write_atomic "$STATE/discoveries-$disc_day" $(( $(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0) + 1 ))
   IN_FLIGHT_SCANNED="$STATE/scanned/$repo"
   IN_FLIGHT_DISC_DAY="$disc_day"
   local d base branch info disc_ok
@@ -2018,7 +2098,7 @@ discover() { # <repo>
     rm -f "$STATE/scanned/$repo"; give_back_discovery; IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
     log "  couldn't read $repo's default branch from GitHub; trying again next tick"; return 1
   fi
-  branch="$LABEL/$(date +%Y%m%d-%H%M)"
+  branch="$LABEL/$(date +%Y%m%d-%H%M%S)"   # two manual ticks in one minute must not share a branch
   prep_worktree "$repo" "$base" || { IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=; fail "worktree setup failed for $repo"; return 1; }
   d=$WT_DIR
   prep_deps "$d" "$repo"
@@ -2066,13 +2146,13 @@ EOF
   retry() {
     rm -f "$STATE/scanned/$repo"
     if [[ $ENGINE != claude ]]; then
-      local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$disc_day"
+      local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && write_atomic "$STATE/discoveries-$disc_day" $(( n - 1 ))
     fi
     free_failed "$key" "${1:-}"
   }
   (( rc == 2 )) && { retry all; return; }
   if (( rc == 3 )); then   # agent outage: give back the scan and today's discovery slot
-    rm -f "$STATE/scanned/$repo"; local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$disc_day"
+    rm -f "$STATE/scanned/$repo"; local n; n=$(cat "$STATE/discoveries-$disc_day" 2>/dev/null || echo 0); (( n > 0 )) && write_atomic "$STATE/discoveries-$disc_day" $(( n - 1 ))
     log "  will retry with another agent"; return
   fi
   [[ -z $out ]] && { log "  no structured result"; retry; return; }
@@ -2130,6 +2210,11 @@ fix_more_window() {
   local w=$(( ${FIX_MORE_WITHIN:-15} * 60 )) cap=$(( 3900 - 600 - $(dur_secs "$FREE_TIMEOUT") - $(dur_secs "$FREE_NUDGE_TIMEOUT") ))
   echo $(( w < cap ? w : cap ))
 }
+tick_stderr_restore() { # close the tee pipe so its output is fully flushed before main() exits
+  [[ ${TICK_STDERR_SAVED:-0} == 1 ]] || return 0
+  exec 2>&8 8>&-
+  TICK_STDERR_SAVED=0
+}
 tick() {
   exec 9>"$STATE/lock"; flock -n 9 || { log "previous tick still running"; exit 0; }
   IN_FLIGHT_SCANNED=; IN_FLIGHT_DISC_DAY=
@@ -2141,12 +2226,14 @@ tick() {
       rm -f "$IN_FLIGHT_SCANNED"
       if [[ -n ${IN_FLIGHT_DISC_DAY:-} ]]; then
         local n; n=$(cat "$STATE/discoveries-$IN_FLIGHT_DISC_DAY" 2>/dev/null || echo 0)
-        (( n > 0 )) && echo $(( n - 1 )) > "$STATE/discoveries-$IN_FLIGHT_DISC_DAY"
+        (( n > 0 )) && write_atomic "$STATE/discoveries-$IN_FLIGHT_DISC_DAY" $(( n - 1 ))
       fi
     fi
+    tick_stderr_restore
     exit 143
   }
   trap on_tick_abort TERM INT
+  trap cleanup_sandbox_placeholders EXIT
   # A bash error inside $(...) (e.g. an unbound variable under set -u) kills only that subshell, so
   # the tick carries on and nothing notices (2026-11-08: a bare `local sid` silently discarded every
   # free-agent result for an hour). Keep this tick's stderr; report the previous tick's script errors.
@@ -2157,6 +2244,7 @@ tick() {
     notify critical "pr-autopilot: script error" "$errs
 (a bug in autopilot.sh; the tick kept going but that step was skipped) journalctl --user -u pr-autopilot" "$(script_error_key "$errs")"
   fi
+  exec 8>&2; TICK_STDERR_SAVED=1
   exec 2> >(tee "$STATE/tick.stderr" >&2 9>&-)   # 9>&-: tee must not hold the tick lock
   log "=== tick [$(bot_version)]$([[ $DRY_RUN == 1 ]] && echo " (dry run)")"
   local cerr; cerr=$(config_errors)
@@ -2164,6 +2252,7 @@ tick() {
     log "config.sh has settings the bot can't use; doing nothing until they are fixed: ${cerr//$'\n'/; }"
     notify critical "pr-autopilot: bad setting in config.sh" "$cerr
 The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "config-error $cerr"
+    tick_stderr_restore
     return 0
   fi
   # Ticks right after a resume from suspend ran before the network was back (2026-11-09 14:45: DNS
@@ -2184,7 +2273,7 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
         "Now first: ${FREE_AGENTS[0]} (was ${old%% *}). Order: $order" "free-top ${FREE_AGENTS[0]}"
     fi
   fi
-  review_prs || return 0   # GitHub unreachable: handled above, not a crash
+  review_prs || { tick_stderr_restore; return 0; }   # GitHub unreachable: handled above, not a crash
   # One fix per tick: the first queued PR that can get an agent now. A PR waiting for Claude
   # (free tries used up; Claude only at night / no token / budget) must not block PRs a free
   # agent can fix, nor discovery (2026-11-08: hyprland-mcp#24 blocked everything 18:20-18:58).
@@ -2232,6 +2321,7 @@ The bot does nothing until this is fixed (./autopilot.sh doctor checks it)." "co
   daily_digest || true
   housekeeping || true
   daily_doctor || true
+  tick_stderr_restore
 }
 
 # Once a day the tick runs doctor itself and alerts on a FAIL, so a broken setup (gh logged out,
@@ -2241,13 +2331,13 @@ daily_doctor() {
   local mark="$STATE/doctor-day" d out fails l tries
   d=$(today)
   [[ $DRY_RUN == 1 || $(cat "$mark" 2>/dev/null) == "$d" ]] && return 0
-  if out=$(doctor 2>&1); then echo "$d" > "$mark"; rm -f "$mark.retry"; log "daily check: healthy"; return 0; fi
+  if out=$(doctor 2>&1); then write_atomic "$mark" "$d"; rm -f "$mark.retry"; log "daily check: healthy"; return 0; fi
   fails=$($GREP -E '^  FAIL  ' <<<"$out" | sed 's/^  FAIL  //')
   if [[ $fails == "GitHub did not answer"* && $fails != *$'\n'* ]]; then
     tries=$(cat "$mark.retry" 2>/dev/null); [[ $tries =~ ^[0-9]+$ ]] || tries=0
     if (( tries < 2 )); then echo $((tries + 1)) > "$mark.retry"; log "daily check: GitHub did not answer; trying again next tick"; return 0; fi
   fi
-  echo "$d" > "$mark"; rm -f "$mark.retry"
+  write_atomic "$mark" "$d"; rm -f "$mark.retry"
   log "daily check: not healthy"
   while IFS= read -r l; do [[ -n $l ]] && log "  FAIL $l"; done <<<"$fails"
   notify critical "pr-autopilot: daily check found a problem" "${fails:-doctor failed; run ./autopilot.sh doctor}" "doctor ${fails}"
@@ -2689,10 +2779,15 @@ show_models() {
 # prohibits the merge" names no rule, so check the rules that can never pass on their own
 # (2026-11-08: hyprland-mcp#24 took four rounds: approvals, a cron-only required check, CodeQL not
 # set up, a code quality rule on a repo without code quality). Prints "; "-joined reasons.
-merge_block_reasons() {
-  local repo=$1 n=$2 base=$3 rules pv why=() x
-  rules=$(gh api "repos/$OWNER/$repo/rules/branches/$base" 2>/dev/null) || rules='[]'
-  pv=$(gh pr view "$n" -R "$OWNER/$repo" --json reviewDecision,statusCheckRollup 2>/dev/null) || pv='{}'
+merge_block_reasons() { # <repo> <n> <base> [cached PR JSON from load_prs]
+  local repo=$1 n=$2 base=$3 cached=${4:-} rules pv why=() x
+  rules=$(gh api "repos/$OWNER/$repo/rules/branches/${base//\//%2F}" 2>/dev/null) || rules='[]'
+  if [[ -n $cached ]]; then
+    # load_prs already fetched reviewDecision, checks and threads: no extra REST/GraphQL call.
+    pv=$(jq -c '{reviewDecision:(.review_decision // ""), statusCheckRollup:[(.checks // [])[] | {name:.}], threads:(.threads // [])}' <<<"$cached")
+  else
+    pv=$(gh pr view "$n" -R "$OWNER/$repo" --json reviewDecision,statusCheckRollup 2>/dev/null) || pv='{}'
+  fi
   x=$(jq -r --argjson pv "$pv" '[.[] | select(.type == "pull_request") | .parameters.required_approving_review_count // 0] | max // 0
         | if . > 0 and ($pv.reviewDecision // "") != "APPROVED" then "needs \(.) approving review(s), and you cannot approve PRs the bot opened as you" else empty end' <<<"$rules")
   [[ -n $x ]] && why+=("$x")
@@ -2720,8 +2815,12 @@ merge_block_reasons() {
     [[ -n $x ]] && why+=("the ruleset requires signed commits, and these commits are unsigned: $x")
   fi
   if jq -e 'any(.[]; .type == "pull_request" and .parameters.required_review_thread_resolution)' <<<"$rules" >/dev/null; then
-    x=$(gh api graphql -F n="$n" -f o="$OWNER" -f r="$repo" -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}' \
-          --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' 2>/dev/null)
+    if [[ -n $cached ]]; then
+      x=$(jq '.threads | length' <<<"$pv")   # load_prs already filtered to unresolved/reopened
+    else
+      x=$(gh api graphql -F n="$n" -f o="$OWNER" -f r="$repo" -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved}}}}}' \
+            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' 2>/dev/null)
+    fi
     (( ${x:-0} > 0 )) && why+=("the ruleset requires resolved conversations, and $x are still open")
   fi
   local IFS=';'; x="${why[*]}"; printf '%s' "${x//;/; }"
@@ -2790,6 +2889,16 @@ config_errors() {
   [[ ${WEEK_TARGET-} =~ ^[0-9]{1,6}$ ]] && (( 10#$WEEK_TARGET > 100 )) && echo "WEEK_TARGET is $WEEK_TARGET, over 100"
   for v in WINDOW_START WINDOW_END; do
     x=${!v-}; [[ $x =~ ^[0-9]{1,6}$ ]] && (( 10#$x > 24 )) && echo "$v is $x, not an hour (0-24)"
+  done
+  # Tinyproxy's Filter matches substrings when unanchored: api.anthropic.com.attacker.tld would
+  # pass a bare api.anthropic.com pattern. Every entry must be anchored at both ends.
+  for v in AGENT_HOSTS DEPS_HOSTS; do
+    declare -p "$v" >/dev/null 2>&1 || { echo "$v is not defined"; continue; }
+    local -n hosts=$v
+    local h; for h in "${hosts[@]}"; do
+      [[ $h == ^*\$ ]] || echo "$v entry \"$h\" is not anchored with ^ and $"
+    done
+    unset -n hosts
   done
   [[ ${OWNER-} =~ ^[A-Za-z0-9-]+$ ]] || echo "OWNER is \"${OWNER-}\", not a GitHub login"
   [[ ${MERGE_METHOD-} =~ ^(squash|merge|rebase)$ ]] || echo "MERGE_METHOD is \"${MERGE_METHOD-}\", not squash, merge or rebase"
@@ -2962,7 +3071,7 @@ show_status() {
   while read -r r; do
     excluded "$r" && continue
     last=$(cat "$STATE/scanned/$r" 2>/dev/null || echo 0)
-    if $GREP -qx "$r" <<<"$busy"; then s="has an open bot PR"
+    if $GREP -qxF -- "$r" <<<"$busy"; then s="has an open bot PR"
     elif (( NOW - last < REDISCOVER_DAYS * 86400 )); then s="eligible $(date -d "@$((last + REDISCOVER_DAYS * 86400))" '+%m-%d %H:%M')"
     elif (( first )); then s="eligible now  <- next${held:+ ($held)}"; first=0
     else s="eligible now"; fi
